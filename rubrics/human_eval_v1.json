@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "name": "prompt-metrics human rubric v1",
+  "version": "1.0.0",
+  "dimensions": [
+    {
+      "id": "accuracy",
+      "label": "Accuracy",
+      "scale_min": 1,
+      "scale_max": 5,
+      "description": "Factual correctness and task completion relative to the reference / ground truth.",
+      "levels": {
+        "1": "Completely incorrect. Major factual errors, fails the task entirely, or answers a different question.",
+        "2": "Mostly incorrect. Contains critical factual errors; less than half of required elements are correct.",
+        "3": "Partially correct. Core claim is broadly right but contains notable factual errors or omissions.",
+        "4": "Mostly correct. All key facts are accurate; only minor omissions or non-critical imprecisions.",
+        "5": "Fully accurate. All factual claims are correct, complete, and fully address the prompt requirements."
+      }
+    },
+    {
+      "id": "fluency",
+      "label": "Fluency",
+      "scale_min": 1,
+      "scale_max": 5,
+      "description": "Clarity, coherence, grammar, and readability of the generated response.",
+      "levels": {
+        "1": "Incoherent. Grammar errors severely impede understanding; fragmented or nonsensical.",
+        "2": "Poor fluency. Frequent grammatical errors, awkward phrasing, hard to follow.",
+        "3": "Acceptable. Understandable but stiff or repetitive; occasional grammar/clarity issues.",
+        "4": "Good. Clear, well-structured, natural phrasing with only minor stylistic issues.",
+        "5": "Excellent. Fluent, concise, well-organized, and appropriately toned for the target audience."
+      }
+    },
+    {
+      "id": "hallucination_check",
+      "label": "Hallucination Check",
+      "scale_min": 1,
+      "scale_max": 5,
+      "description": "Strict grounding / faithfulness check. Are all claims supported by the provided context or verifiable knowledge? Lower is worse (more hallucination).",
+      "strict": true,
+      "levels": {
+        "1": "Severe hallucination. Multiple fabricated facts, citations, numbers, or entities. Not grounded.",
+        "2": "Major hallucination. One or more critical unsupported claims that change the answer's meaning.",
+        "3": "Moderate hallucination risk. Contains unverifiable embellishments or inferred details not supported by context.",
+        "4": "Minor grounding issues. All substantive claims are supported; at most one trivial unsourced detail.",
+        "5": "Fully grounded. Every claim is supported by the provided context / reference. Zero hallucinations."
+      }
+    }
+  ],
+  "aggregation": {
+    "method": "mean",
+    "per_dimension": true
+  },
+  "inter_rater_reliability": "krippendorff_alpha",
+  "scoring_notes": "Hallucination_check is strict: if any score <=2 is assigned, flag response for manual review regardless of overall mean."
+}
