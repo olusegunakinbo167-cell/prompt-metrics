@@ -26,6 +26,7 @@ from .evaluators import (
     KeywordEvaluator,
     QAEvaluator,
     RegexMatchEvaluator,
+    SemanticSimilarityEvaluator,
     RUBRIC_TEMPLATES,
 )
 from .export import export_results
@@ -34,7 +35,7 @@ from .runner import ExperimentRunner, load_dataset
 
 
 # ---------------------------------------------------------------------------
-# Model client resolution
+# Callable resolution
 # ---------------------------------------------------------------------------
 
 
@@ -88,8 +89,8 @@ def _resolve_callable(spec: str, kind: str = "callable") -> Callable[[str], str]
 
 # Evaluator name → factory
 # Factories are 0-arg callables that return an evaluator instance.
-# For model-based evaluators that need a model_client, the factory
-# reads JUDGE_MODEL env var or --judge-model CLI arg (see _make_judge_factory).
+# For evaluators that need external clients (judge model, embedding model),
+# the factory reads the corresponding CLI arg / env var.
 EVALUATOR_REGISTRY: dict[str, Callable[[], Any]] = {}
 
 
@@ -99,7 +100,7 @@ def _make_judge_factory(
     rubric: str | None = None,
 ) -> Callable[[], Any]:
     """
-    Create a factory function for a model-based evaluator.
+    Create a factory function for a model-based evaluator (LLM-as-a-judge).
 
     The factory resolves the judge model client from, in order:
       1. --judge-model CLI argument (stored in _JUDGE_MODEL_SPEC global)
@@ -134,6 +135,36 @@ def _make_judge_factory(
     return factory
 
 
+def _make_semantic_factory() -> Callable[[], Any]:
+    """
+    Create a factory function for SemanticSimilarityEvaluator.
+
+    The factory resolves an embedding client from, in order:
+      1. --embedding-model CLI argument
+      2. EMBEDDING_MODEL environment variable
+      3. Falls back to built-in TF-IDF / sentence-transformers auto-detect
+         (no error — local fallback is always available)
+    """
+    def factory() -> Any:
+        # Try to resolve an explicit embedding client
+        spec = getattr(_make_semantic_factory, "_embedding_model_spec", None) or os.environ.get(
+            "EMBEDDING_MODEL"
+        )
+        if spec:
+            try:
+                embedding_client = _resolve_callable(spec, kind="embedding model")
+            except Exception as e:
+                raise RuntimeError(f"Failed to resolve embedding model {spec!r}: {e}") from e
+            # Wrap to adapt signature: embedding_client(text: str) -> list[float]
+            # _resolve_callable already validates it's callable
+            return SemanticSimilarityEvaluator(embedding_client=embedding_client)  # type: ignore[arg-type]
+
+        # No explicit client — use built-in fallback (TF-IDF / sentence-transformers auto-detect)
+        return SemanticSimilarityEvaluator()
+
+    return factory
+
+
 def _register_builtin_evaluators() -> None:
     """Populate EVALUATOR_REGISTRY with all built-in evaluators."""
     EVALUATOR_REGISTRY.clear()
@@ -147,6 +178,10 @@ def _register_builtin_evaluators() -> None:
             "contains": ContainsEvaluator,
             "regex": RegexMatchEvaluator,
             "regex_match": RegexMatchEvaluator,
+            # Semantic evaluator
+            # Uses TF-IDF fallback by default, or --embedding-model for custom embeddings
+            "semantic": _make_semantic_factory(),
+            "semantic_similarity": _make_semantic_factory(),
             # Model-based evaluators (LLM-as-a-judge)
             # These require --judge-model or JUDGE_MODEL env var
             "qa_judge": _make_judge_factory(QAEvaluator),
@@ -236,6 +271,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="prompt_metrics",
         description=(
             "Run prompt evaluation experiments over a JSON test dataset.\n\n"
+            "Semantic evaluator: uses TF-IDF fallback by default, or configure\n"
+            "  --embedding-model <module:callable> / EMBEDDING_MODEL for custom embeddings.\n"
             "Model-based evaluators (qa_judge, critique_judge) require a judge model.\n"
             "Configure with --judge-model <module:callable> or JUDGE_MODEL env var."
         ),
@@ -248,6 +285,13 @@ examples:
   prompt_metrics --dataset data/test_cases.json --evaluators exact_match,keyword
   prompt_metrics --dataset data/test_cases.json --formats csv,md
   prompt_metrics --dataset data/test_cases.json --generator my_llm:generate
+
+  # Semantic similarity (TF-IDF fallback, zero dependencies):
+  prompt_metrics --dataset data/test_cases.json --evaluators semantic
+
+  # Semantic similarity with custom embedding API:
+  prompt_metrics --dataset data/test_cases.json \\
+    --evaluators semantic --embedding-model my_embeddings:embed
 
   # LLM-as-a-judge evaluation:
   prompt_metrics --dataset data/test_cases.json \\
@@ -308,6 +352,19 @@ examples:
         ),
     )
     p.add_argument(
+        "--embedding-model",
+        default=None,
+        help=(
+            "Embedding client for semantic similarity evaluator, "
+            "in 'module:callable' format. e.g. \"my_embeddings:embed\". "
+            "The callable must accept (text: str) -> list[float] and return "
+            "an embedding vector. "
+            "If omitted, uses built-in TF-IDF fallback (zero dependencies) "
+            "or auto-detects sentence-transformers if installed. "
+            "Can also be set via EMBEDDING_MODEL environment variable."
+        ),
+    )
+    p.add_argument(
         "--fail-fast",
         action="store_true",
         help="Stop on the first case/generator error instead of continuing.",
@@ -319,21 +376,27 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # ---- Store judge_model spec for evaluator factories ----
-    # Model-based evaluator factories read this global to resolve their model_client
+    # ---- Store judge_model / embedding_model specs for evaluator factories ----
+    # Evaluator factories read these globals to resolve their clients
     if args.judge_model:
         setattr(_make_judge_factory, "_judge_model_spec", args.judge_model)
+    if args.embedding_model:
+        setattr(_make_semantic_factory, "_embedding_model_spec", args.embedding_model)
 
-    # ---- Validate & resolve evaluators ----
+    # Re-register evaluators so semantic factory picks up the --embedding-model arg
+    # (factory closures capture the spec at instantiation time)
+    _register_builtin_evaluators()
     _try_import_external_evaluators()
 
+    # ---- Validate & resolve evaluators ----
     if args.evaluators.strip():
         requested = [e.strip() for e in args.evaluators.split(",") if e.strip()]
     else:
         # Default: all built-in TEXT evaluators only
         # (skip model-based judges and external evaluators like rubric_qa
         # unless explicitly requested, since they need a judge model / rubric file)
-        requested = ["exact_match", "keyword", "contains"]
+        # Semantic evaluator is included in the default set — TF-IDF fallback is free
+        requested = ["exact_match", "keyword", "contains", "semantic"]
 
     unknown = [e for e in requested if e not in EVALUATOR_REGISTRY]
     if unknown:
