@@ -8,6 +8,9 @@ Text-based evaluators:
   - RegexMatchEvaluator
   - ContainsEvaluator
 
+Semantic evaluator:
+  - SemanticSimilarityEvaluator
+
 Model-based evaluators (LLM-as-a-judge):
   - QAEvaluator
   - CritiqueEvaluator
@@ -20,6 +23,7 @@ from .model import (
     QAEvaluator,
     RUBRIC_TEMPLATES,
 )
+from .semantic import EmbeddingClient, SemanticSimilarityEvaluator
 from .text import (
     ContainsEvaluator,
     ExactMatchEvaluator,
@@ -37,6 +41,9 @@ __all__ = [
     "KeywordEvaluator",
     "RegexMatchEvaluator",
     "ContainsEvaluator",
+    # Semantic evaluator
+    "SemanticSimilarityEvaluator",
+    "EmbeddingClient",
     # Model-based evaluators
     "QAEvaluator",
     "CritiqueEvaluator",

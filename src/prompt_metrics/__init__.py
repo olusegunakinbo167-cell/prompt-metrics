@@ -2,6 +2,7 @@
 from .evaluators import (
     ContainsEvaluator,
     CritiqueEvaluator,
+    EmbeddingClient,
     Evaluator,
     EvaluatorAdapter,
     ExactMatchEvaluator,
@@ -9,6 +10,7 @@ from .evaluators import (
     ModelEvaluator,
     QAEvaluator,
     RegexMatchEvaluator,
+    SemanticSimilarityEvaluator,
     RUBRIC_TEMPLATES,
 )
 from .export import export_results, flatten_dict
@@ -41,6 +43,9 @@ __all__ = [
     "KeywordEvaluator",
     "RegexMatchEvaluator",
     "ContainsEvaluator",
+    # Evaluators — semantic
+    "SemanticSimilarityEvaluator",
+    "EmbeddingClient",
     # Evaluators — model-based
     "QAEvaluator",
     "CritiqueEvaluator",
