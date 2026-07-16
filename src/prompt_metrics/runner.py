@@ -1,99 +1,106 @@
+# src/prompt_metrics/runner.py
+"""
+ExperimentRunner — batch execution engine for prompt evaluation.
+
+Dataset format (JSON list):
+[
+  {
+    "id": "case_001",
+    "input_prompt": "Explain quantum entanglement in simple terms.",
+    "expected_text": "Quantum entanglement is ... (optional ground truth)",
+    "keywords": ["entangled", "particles", "quantum"]  // optional
+  },
+  ...
+]
+"""
+
 from __future__ import annotations
-import time
+
 import json
-from typing import Callable, List, Dict, Any, Protocol, Optional
+import time
+import traceback
+from dataclasses import asdict, dataclass, field
+from typing import Any, Callable
+
+from .evaluators.base import Evaluator, EvaluatorAdapter
+
+# Re-export for backwards compatibility
+__all_runner_protocols__ = ["Evaluator", "EvaluatorAdapter"]
 
 
-class Evaluator(Protocol):
-    name: str
+# ---------------------------------------------------------------------------
+# Dataset loading
+# ---------------------------------------------------------------------------
 
-    def evaluate(self, case: dict, output_text: str) -> dict: ...
+@dataclass
+class TestCase:
+    """A single test case from the dataset."""
+    id: str
+    input_prompt: str
+    expected_text: str | None = None
+    keywords: list[str] | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-
-class RubricEvaluatorAdapter:
-    """Adapter: wraps legacy RubricEvaluator.score(output_text) -> float|dict"""
-
-    def __init__(self, evaluator: Any):
-        self._inner = evaluator
-        self.name = getattr(evaluator, "name", evaluator.__class__.__name__)
-
-    def evaluate(self, case: dict, output_text: str) -> dict:
-        if hasattr(self._inner, "evaluate"):
-            return self._inner.evaluate(case, output_text)
-        score_fn = getattr(self._inner, "score", None)
-        if not callable(score_fn):
-            raise AttributeError(
-                f"Evaluator {self.name} has neither evaluate() nor score()"
-            )
-        result = score_fn(output_text)
-        if isinstance(result, dict):
-            return result
-        return {"score": float(result)}
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "TestCase":
+        return cls(
+            id=data["id"],
+            input_prompt=data["input_prompt"],
+            expected_text=data.get("expected_text"),
+            keywords=data.get("keywords"),
+            metadata={k: v for k, v in data.items()
+                      if k not in {"id", "input_prompt", "expected_text", "keywords"}}
+        )
 
 
-def _wrap_evaluator(ev: Any) -> Evaluator:
-    if hasattr(ev, "evaluate") and callable(ev.evaluate):
-        return ev  # type: ignore
-    return RubricEvaluatorAdapter(ev)  # type: ignore
+def load_dataset(path: str) -> list[TestCase]:
+    """Load a JSON dataset file into a list of TestCase objects."""
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, list):
+        raise ValueError("Dataset JSON must be a list of test case objects")
+    return [TestCase.from_dict(item) for item in raw]
 
 
+# ---------------------------------------------------------------------------
+# Results
+# ---------------------------------------------------------------------------
+
+@dataclass
 class CaseResult:
-    def __init__(
-        self,
-        case_id: Optional[str],
-        input_prompt: str,
-        generated_response: str,
-        expected_text: Optional[str],
-        keywords: Optional[List[str]],
-        evaluator_results: Dict[str, Any],
-        latencies_ms: Dict[str, int],
-        errors: List[Dict[str, str]],
-    ):
-        self.case_id = case_id
-        self.input_prompt = input_prompt
-        self.generated_response = generated_response
-        self.expected_text = expected_text
-        self.keywords = keywords
-        self.evaluator_results = evaluator_results
-        self.latencies_ms = latencies_ms
-        self.errors = errors
+    """Structured result for a single test case."""
+    case_id: str
+    input_prompt: str
+    generated_response: str
+    expected_text: str | None = None
+    keywords: list[str] | None = None
+    evaluator_results: dict[str, Any] = field(default_factory=dict)
+    latency_ms: float = 0.0
+    error: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "case_id": self.case_id,
-            "input_prompt": self.input_prompt,
-            "generated_response": self.generated_response,
-            "expected_text": self.expected_text,
-            "keywords": self.keywords,
-            "evaluator_results": self.evaluator_results,
-            "latencies_ms": self.latencies_ms,
-            "errors": self.errors,
-        }
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
+@dataclass
 class SuiteResult:
-    def __init__(
-        self,
-        results: List[CaseResult],
-        evaluator_names: List[str],
-        total_runtime_ms: int,
-        success_count: int,
-        fail_count: int,
-    ):
-        self.results = results
-        self.evaluator_names = evaluator_names
-        self.total_runtime_ms = total_runtime_ms
-        self.success_count = success_count
-        self.fail_count = fail_count
+    """Aggregated results for a full experiment suite run."""
+    results: list[CaseResult]
+    evaluator_names: list[str]
+    total_cases: int
+    successful_cases: int
+    failed_cases: int
+    total_runtime_s: float
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
-            "metadata": {
-                "evaluator_names": self.evaluator_names,
-                "total_runtime_ms": self.total_runtime_ms,
-                "success_count": self.success_count,
-                "fail_count": self.fail_count,
-                "total_cases": len(self.results),
+            "summary": {
+                "total_cases": self.total_cases,
+                "successful_cases": self.successful_cases,
+                "failed_cases": self.failed_cases,
+                "total_runtime_s": round(self.total_runtime_s, 3),
+                "evaluators": self.evaluator_names,
             },
             "results": [r.to_dict() for r in self.results],
         }
@@ -103,76 +110,179 @@ class SuiteResult:
             json.dump(self.to_dict(), f, indent=2)
 
 
+# ---------------------------------------------------------------------------
+# ExperimentRunner
+# ---------------------------------------------------------------------------
+
 class ExperimentRunner:
-    def __init__(self, evaluators: List[Any]):
-        self.evaluators: List[Evaluator] = [_wrap_evaluator(ev) for ev in evaluators]
+    """
+    Batch experiment execution engine.
+
+    Runs a generator function over a dataset and evaluates each output
+    with a configured list of evaluators.
+
+    Example:
+        runner = ExperimentRunner([
+            RubricEvaluator.from_file("rubrics/standard_qa_rubric.json"),
+            KeywordMatchEvaluator(),
+        ])
+        suite = runner.run_suite(
+            dataset=load_dataset("data/test_cases.json"),
+            generator_fn=lambda prompt: my_llm.generate(prompt)
+        )
+        suite.save_json("results/run_2026-07-16.json")
+    """
+
+    def __init__(self, evaluators: list[Any]):
+        """
+        Args:
+            evaluators: List of evaluator instances. Each must either:
+                - implement .evaluate(prompt, response, ...)
+                - implement .score(prompt, response)  (RubricEvaluator-compatible)
+                - or be wrapped in EvaluatorAdapter
+        """
+        self.evaluators: list[Evaluator] = []
+        for ev in evaluators:
+            if isinstance(ev, EvaluatorAdapter):
+                self.evaluators.append(ev)  # type: ignore
+            elif hasattr(ev, "evaluate"):
+                # Already protocol-compliant — ensure it has a name
+                if not hasattr(ev, "name"):
+                    setattr(ev, "name", ev.__class__.__name__)
+                self.evaluators.append(ev)  # type: ignore
+            else:
+                # Auto-wrap legacy evaluators (e.g. RubricEvaluator)
+                wrapped = EvaluatorAdapter(ev)
+                self.evaluators.append(wrapped)  # type: ignore
+
+        if not self.evaluators:
+            raise ValueError("ExperimentRunner requires at least one evaluator")
+
+    # ---- dataset loading helpers ----
+
+    @staticmethod
+    def load_dataset(path: str) -> list[TestCase]:
+        """Convenience alias: ExperimentRunner.load_dataset(path)"""
+        return load_dataset(path)
+
+    # ---- core execution ----
 
     def run_suite(
         self,
-        dataset: List[Dict[str, Any]],
+        dataset: list[dict[str, Any] | TestCase],
         generator_fn: Callable[[str], str],
+        *,
         continue_on_error: bool = True,
         verbose: bool = False,
     ) -> SuiteResult:
+        """
+        Run the full experiment suite.
+
+        Args:
+            dataset: List of test case dicts or TestCase objects.
+                Each dict must have: id, input_prompt
+                Optional: expected_text, keywords
+            generator_fn: Callable that takes (input_prompt: str) -> str
+                This is where you plug in your LLM / mock generator.
+            continue_on_error: If True, log errors per-case and continue.
+                If False, raise on first error.
+            verbose: Print progress to stdout.
+
+        Returns:
+            SuiteResult with all case results and aggregate stats.
+        """
+        # Normalise dataset → list[TestCase]
+        cases: list[TestCase] = [
+            c if isinstance(c, TestCase) else TestCase.from_dict(c)
+            for c in dataset
+        ]
+
+        results: list[CaseResult] = []
         suite_start = time.perf_counter()
-        results: List[CaseResult] = []
-        success_count = 0
-        fail_count = 0
+        failed = 0
 
-        for case in dataset:
-            case_errors: List[Dict[str, str]] = []
-            case_latencies: Dict[str, int] = {}
+        for i, case in enumerate(cases, 1):
+            if verbose:
+                print(f"[{i}/{len(cases)}] {case.id} ...", end=" ", flush=True)
 
-            # Step 1: Run Generator
-            gen_start = time.perf_counter()
-            try:
-                response_text = generator_fn(case["input_prompt"])
-                success_count += 1
-            except Exception as e:
-                response_text = ""
-                case_errors.append({"stage": "generator", "error": str(e)})
-                fail_count += 1
+            case_result = self._run_single_case(case, generator_fn)
+
+            if case_result.error:
+                failed += 1
+                if verbose:
+                    print(f"ERROR: {case_result.error}")
                 if not continue_on_error:
-                    raise e
-            case_latencies["generator"] = int(
-                (time.perf_counter() - gen_start) * 1000
-            )
-
-            # Step 2: Run Evaluators
-            evaluator_results = {}
-            for ev in self.evaluators:
-                ev_start = time.perf_counter()
-                try:
-                    evaluator_results[ev.name] = ev.evaluate(case, response_text)
-                except Exception as ev_err:
-                    evaluator_results[ev.name] = {"error": str(ev_err)}
-                    case_errors.append(
-                        {"stage": f"evaluator_{ev.name}", "error": str(ev_err)}
+                    raise RuntimeError(
+                        f"Case {case.id} failed: {case_result.error}"
                     )
-                case_latencies[ev.name] = int(
-                    (time.perf_counter() - ev_start) * 1000
-                )
+            elif verbose:
+                print("✓")
 
-            results.append(
-                CaseResult(
-                    case_id=case.get("id"),
-                    input_prompt=case["input_prompt"],
-                    generated_response=response_text,
-                    expected_text=case.get("expected_text"),
-                    keywords=case.get("keywords"),
-                    evaluator_results=evaluator_results,
-                    latencies_ms=case_latencies,
-                    errors=case_errors,
-                )
-            )
+            results.append(case_result)
 
-        total_runtime_ms = int((time.perf_counter() - suite_start) * 1000)
-        eval_names = [ev.name for ev in self.evaluators]
+        total_runtime = time.perf_counter() - suite_start
 
         return SuiteResult(
             results=results,
-            evaluator_names=eval_names,
-            total_runtime_ms=total_runtime_ms,
-            success_count=success_count,
-            fail_count=fail_count,
+            evaluator_names=[ev.name for ev in self.evaluators],
+            total_cases=len(cases),
+            successful_cases=len(cases) - failed,
+            failed_cases=failed,
+            total_runtime_s=total_runtime,
+        )
+
+    def _run_single_case(
+        self,
+        case: TestCase,
+        generator_fn: Callable[[str], str],
+    ) -> CaseResult:
+        """Execute one test case: generate → evaluate → record."""
+        # --- 1. Generate ---
+        gen_start = time.perf_counter()
+        try:
+            generated = generator_fn(case.input_prompt)
+        except Exception as e:
+            return CaseResult(
+                case_id=case.id,
+                input_prompt=case.input_prompt,
+                generated_response="",
+                expected_text=case.expected_text,
+                keywords=case.keywords,
+                error=f"generator_fn failed: {e}\n{traceback.format_exc()}",
+                metadata=case.metadata,
+            )
+        latency_ms = (time.perf_counter() - gen_start) * 1000
+
+        # --- 2. Evaluate ---
+        evaluator_results: dict[str, Any] = {}
+        eval_error: str | None = None
+
+        for ev in self.evaluators:
+            try:
+                score = ev.evaluate(  # type: ignore[attr-defined]
+                    prompt=case.input_prompt,
+                    response=generated,
+                    expected_text=case.expected_text,
+                    keywords=case.keywords,
+                    case_id=case.id,
+                )
+                evaluator_results[ev.name] = score  # type: ignore[attr-defined]
+            except Exception as e:
+                evaluator_results[getattr(ev, "name", str(ev))] = {
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                }
+                eval_error = f"Evaluator {getattr(ev, 'name', ev)} failed: {e}"
+
+        # --- 3. Record ---
+        return CaseResult(
+            case_id=case.id,
+            input_prompt=case.input_prompt,
+            generated_response=generated,
+            expected_text=case.expected_text,
+            keywords=case.keywords,
+            evaluator_results=evaluator_results,
+            latency_ms=round(latency_ms, 2),
+            error=eval_error,
+            metadata=case.metadata,
         )
