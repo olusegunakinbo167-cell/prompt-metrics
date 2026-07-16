@@ -14,6 +14,7 @@ from .evaluators import (
     RUBRIC_TEMPLATES,
 )
 from .export import export_results, flatten_dict
+from .monitoring import compare_suites, load_suite_result
 from .reports import generate_markdown_report
 from .runner import (
     ExperimentRunner,
@@ -22,6 +23,7 @@ from .runner import (
     TestCase,
     load_dataset,
 )
+from .synthesis import DatasetSynthesizer
 
 __all__ = [
     # Core runner
@@ -50,4 +52,9 @@ __all__ = [
     "QAEvaluator",
     "CritiqueEvaluator",
     "RUBRIC_TEMPLATES",
+    # Monitoring / regression
+    "compare_suites",
+    "load_suite_result",
+    # Synthesis
+    "DatasetSynthesizer",
 ]
