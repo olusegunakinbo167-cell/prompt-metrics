@@ -1,8 +1,34 @@
 """Unit tests for the core evaluation engine."""
 
 import pytest
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
-from src.prompt_metrics.evaluators import ExactMatchEvaluator, KeywordEvaluator
+from src.prompt_metrics.evaluators import (
+    ExactMatchEvaluator,
+    KeywordEvaluator,
+    JSONLLMEvaluator,
+    _JudgeScore,
+)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _mock_judge_eval(monkeypatch, score: int, reasoning: str, confidence: float):
+    """Patch JSONLLMEvaluator._openai_client to return a canned _JudgeScore."""
+    parsed = _JudgeScore(score=score, reasoning=reasoning, confidence=confidence)
+    mock_resp = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(parsed=parsed))]
+    )
+    mock_client = MagicMock()
+    mock_client.beta.chat.completions.parse.return_value = mock_resp
+    monkeypatch.setattr(
+        JSONLLMEvaluator,
+        "_openai_client",
+        property(lambda self: mock_client),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -122,3 +148,66 @@ def test_keyword_substring_matching():
     result = ev.evaluate("this is a testing ground")
     assert result["score_raw"] == 1
     assert result["score_norm"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# JSONLLMEvaluator
+# ---------------------------------------------------------------------------
+
+def test_json_llm_success_max_score(monkeypatch):
+    """Mocked judge returning score 5 normalizes to 1.0 with full metadata."""
+    _mock_judge_eval(
+        monkeypatch,
+        score=5,
+        reasoning="Perfect factual accuracy and excellent tone.",
+        confidence=0.95,
+    )
+
+    rubric = "Rate accuracy and tone, 1-5."
+    ev = JSONLLMEvaluator(rubric=rubric, model="gpt-4o-mini")
+
+    result = ev.evaluate(
+        response_text="Paris is the capital of France.",
+        expected_text="The capital of France is Paris.",
+    )
+
+    # Score normalization: (5 - 1) / 4 = 1.0
+    assert result["score_raw"] == 5
+    assert result["score_norm"] == pytest.approx(1.0)
+
+    # Metadata mapping
+    md = result["metadata"]
+    assert md["evaluator"] == "json_llm"
+    assert md["reasoning"] == "Perfect factual accuracy and excellent tone."
+    assert md["confidence"] == pytest.approx(0.95)
+    assert md["judge_model"] == "gpt-4o-mini"
+    assert md["rubric"] == rubric
+    assert md["expected_text_provided"] is True
+
+
+def test_json_llm_low_score_normalization(monkeypatch):
+    """Mocked judge returning score 1 normalizes to 0.0 without errors."""
+    _mock_judge_eval(
+        monkeypatch,
+        score=1,
+        reasoning="Completely incorrect and unhelpful.",
+        confidence=0.92,
+    )
+
+    ev = JSONLLMEvaluator(
+        rubric="Rate helpfulness, 1 = worst, 5 = best.",
+        model="gpt-4o-mini",
+    )
+
+    result = ev.evaluate(response_text="The moon is made of cheese.")
+
+    # Score normalization: (1 - 1) / 4 = 0.0
+    assert result["score_raw"] == 1
+    assert result["score_norm"] == pytest.approx(0.0)
+    # Clamping safety – never negative
+    assert result["score_norm"] >= 0.0
+
+    md = result["metadata"]
+    assert md["confidence"] == pytest.approx(0.92)
+    assert md["reasoning"] == "Completely incorrect and unhelpful."
+    assert md["expected_text_provided"] is False
