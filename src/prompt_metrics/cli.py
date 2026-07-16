@@ -1,22 +1,6 @@
 # src/prompt_metrics/cli.py
 """
 Command-line interface for prompt_metrics.
-
-Usage:
-    # Run an evaluation suite:
-    prompt_metrics run --dataset data/test_cases.json
-    prompt_metrics run --dataset data/test_cases.json \\
-        --output-dir ./results/run_001 \\
-        --evaluators exact_match,keyword \\
-        --formats csv,json,md
-
-    # Generate a synthetic dataset:
-    prompt_metrics synthesize \\
-        --description "A SQL query generator" \\
-        --seed-prompts "SELECT users...", "Find all orders..." \\
-        --num-cases 20 \\
-        --model my_llm:generate \\
-        --output dataset.json
 """
 
 from __future__ import annotations
@@ -28,8 +12,8 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
-from .curation import CurationReviewer
 from .archiver import create_run_archive
+from .curation import CurationReviewer
 from .evaluators import (
     ContainsEvaluator,
     CritiqueEvaluator,
@@ -41,19 +25,15 @@ from .evaluators import (
     RUBRIC_TEMPLATES,
 )
 from .export import export_results
-from .reports import generate_markdown_report
+from .monitoring import compare_suites, load_suite_result
+from .reports import generate_comparison_report, generate_markdown_report
 from .runner import ExperimentRunner, load_dataset
 from .synthesis import DatasetSynthesizer
 
 
-# ---------------------------------------------------------------------------
-# Callable resolution
-# ---------------------------------------------------------------------------
-
-
 def _resolve_callable(spec: str, kind: str = "callable") -> Callable[[str], str]:
     if ":" not in spec:
-        raise ValueError(f'{kind} {spec!r} must be in "module:callable" format')
+        raise ValueError(f'{kind} {spec!r} must be "module:callable"')
     module_name, attr = spec.split(":", 1)
     import importlib
     mod = importlib.import_module(module_name)
@@ -61,7 +41,7 @@ def _resolve_callable(spec: str, kind: str = "callable") -> Callable[[str], str]
     for part in attr.split("."):
         obj = getattr(obj, part)
     if not callable(obj):
-        raise TypeError(f"{kind.capitalize()} {spec!r} resolved to {obj!r}, which is not callable")
+        raise TypeError(f"{kind.capitalize()} {spec!r} is not callable")
     return obj  # type: ignore[return-value]
 
 
@@ -72,7 +52,7 @@ def _make_judge_factory(evaluator_cls: type, *, rubric: str | None = None) -> Ca
     def factory() -> Any:
         spec = getattr(_make_judge_factory, "_judge_model_spec", None) or os.environ.get("JUDGE_MODEL")
         if not spec:
-            raise RuntimeError(f"{evaluator_cls.__name__} requires a judge model client. Pass --judge-model <module:callable>")
+            raise RuntimeError(f"{evaluator_cls.__name__} requires a judge model. Pass --judge-model <module:callable> or set JUDGE_MODEL env var.")
         model_client = _resolve_callable(spec, kind="judge model")
         kwargs: dict[str, Any] = {"model_client": model_client}
         if rubric is not None:
@@ -117,7 +97,7 @@ def _try_import_external_evaluators() -> None:
     def rubric_factory() -> Any:
         rubric_path = os.environ.get("RUBRIC_PATH", "rubric.json")
         if not Path(rubric_path).exists():
-            raise FileNotFoundError(f"RubricEvaluator requested, but rubric file not found at {rubric_path!r}")
+            raise FileNotFoundError(f"Rubric file not found at {rubric_path!r}")
         return RubricEvaluator.from_file(rubric_path)
     EVALUATOR_REGISTRY["rubric"] = rubric_factory
     EVALUATOR_REGISTRY["rubric_qa"] = rubric_factory
@@ -136,31 +116,77 @@ def _resolve_generator(spec: str | None) -> Callable[[str], str]:
 def build_parser() -> argparse.ArgumentParser:
     _try_import_external_evaluators()
     available = ", ".join(sorted(EVALUATOR_REGISTRY.keys()))
-    p = argparse.ArgumentParser(prog="prompt_metrics", description="LLM prompt evaluation toolkit — run experiments and generate synthetic test datasets.", formatter_class=argparse.RawDescriptionHelpFormatter)
-    subparsers = p.add_subparsers(dest="command", help="subcommand")
+    p = argparse.ArgumentParser(
+        prog="prompt_metrics",
+        description="LLM prompt evaluation toolkit — run experiments, generate test datasets, curate and archive results.",
+    )
+    subparsers = p.add_subparsers(dest="command", metavar="<command>", help="run | synthesize")
 
-    run_p = subparsers.add_parser("run", help="Run a prompt evaluation experiment over a JSON dataset.", formatter_class=argparse.RawDescriptionHelpFormatter)
-    run_p.add_argument("--dataset", required=True, help="Path to the input JSON dataset file.")
-    run_p.add_argument("--output-dir", default="./results", help="Destination directory for generated outputs (default: ./results).")
-    run_p.add_argument("--evaluators", default="", help=f"Comma-separated list of evaluators to run. Available: {available}.")
-    run_p.add_argument("--formats", default="csv,json,md", help="Comma-separated output formats: csv, json, md (default: all three).")
-    run_p.add_argument("--generator", default=None, help="Generator function in 'module:callable' format.")
-    run_p.add_argument("--judge-model", default=None, help="Judge model client for LLM-as-a-judge evaluators.")
-    run_p.add_argument("--embedding-model", default=None, help="Embedding client for semantic similarity evaluator.")
-    run_p.add_argument("--fail-fast", action="store_true", help="Stop on the first case/generator error instead of continuing.")
-    run_p.add_argument("--archive", nargs="?", const="archives", metavar="ARCHIVE_DIR", help="Archive the run outputs into a timestamped zip file after successful completion. Optionally specify a custom archive directory (default: ./archives). Archive name format: run_YYYYMMDD_HHMMSS_<score>.zip")
+    run_p = subparsers.add_parser("run", help="Run a prompt evaluation experiment.",
+        description="Evaluate prompts against a test dataset with configurable evaluators.")
+    run_p.add_argument("--dataset", required=True,
+        help="Path to test dataset JSON. Each entry needs: id, input_prompt. Optional: expected_text, keywords.")
+    run_p.add_argument("--output-dir", default="./results",
+        help="Output directory for results (default: ./results).")
+    run_p.add_argument("--evaluators", default="",
+        help=f"Comma-separated evaluators to run. Available: {available}. "
+             "Default: exact_match,keyword,contains,semantic. "
+             "Model-based evaluators (qa_judge, critique_*) require --judge-model.")
+    run_p.add_argument("--formats", default="csv,json,md",
+        help="Output formats to generate, comma-separated (default: csv,json,md).")
+    run_p.add_argument("--generator", default=None,
+        help='Generator function as "module:callable" (e.g. "my_llm:generate"). '
+             "Must accept (prompt: str) -> str. Defaults to a mock generator.")
+    run_p.add_argument("--judge-model", default=None,
+        help='Judge model for LLM-as-a-judge evaluators (qa_judge, critique_*), as "module:callable". '
+             "Callable must accept (prompt: str) -> str. Also reads JUDGE_MODEL env var.")
+    run_p.add_argument("--embedding-model", default=None,
+        help='Embedding client for semantic similarity, as "module:callable" (text: str) -> list[float]. '
+             "If omitted, uses built-in TF-IDF fallback (zero dependencies) or auto-detects sentence-transformers. "
+             "Also reads EMBEDDING_MODEL env var.")
+    run_p.add_argument("--fail-fast", action="store_true",
+        help="Stop on the first case/generator error instead of continuing.")
 
-    synth_p = subparsers.add_parser("synthesize", help="Generate a synthetic evaluation dataset using an LLM.", formatter_class=argparse.RawDescriptionHelpFormatter)
-    synth_p.add_argument("--description", required=True, help="Description of the application / prompt being tested.")
-    synth_seed_group = synth_p.add_mutually_exclusive_group()
-    synth_seed_group.add_argument("--seed-prompts", nargs="*", default=[], metavar="PROMPT", help="Seed example prompts / inputs (space-separated).")
-    synth_seed_group.add_argument("--seed-prompts-file", metavar="PATH", help="Path to a text file with seed prompts, one per line.")
-    synth_p.add_argument("--num-cases", type=int, default=10, help="Number of test cases to generate (default: 10).")
-    synth_p.add_argument("--model", default=None, help="Model client for dataset synthesis, in 'module:callable' format.")
-    synth_p.add_argument("--output", "-o", default="synthetic_dataset.json", help="Output path for the generated dataset JSON.")
-    synth_p.add_argument("--case-id-prefix", default="synth", help="Prefix for generated case IDs.")
-    synth_p.add_argument("--interactive", "-i", action="store_true", help="Review, edit, accept, or reject generated test cases interactively before saving.")
+    comp = run_p.add_argument_group("regression monitoring")
+    comp.add_argument("--compare-with", metavar="BASELINE_JSON", default=None,
+        help="Compare this run against a baseline results JSON. "
+             "Prints a regression summary, writes comparison.md, "
+             "and exits with code 3 if regressions are detected.")
+    comp.add_argument("--score-drop-threshold", type=float, default=0.15,
+        help="Score decrease that counts as a regression (default: 0.15).")
+    comp.add_argument("--latency-regression-factor", type=float, default=1.2,
+        help="Latency increase factor that counts as a regression (default: 1.2 = 20%% slower).")
 
+    run_p.add_argument("--archive", nargs="?", const="archives", metavar="ARCHIVE_DIR",
+        help="Bundle run artifacts into a timestamped zip after successful completion. "
+             "Optionally specify a custom archive directory (default: ./archives). "
+             "Archive name: run_YYYYMMDD_HHMMSS_<score>.zip")
+
+    synth_p = subparsers.add_parser("synthesize",
+        help="Generate a synthetic evaluation dataset using an LLM.",
+        description="Expand seed examples + a task description into a diverse test suite with an LLM.")
+    synth_p.add_argument("--description", required=True,
+        help="What the application / prompt being tested does. "
+             "Be specific — this drives test case diversity. "
+             'E.g. "A SQL query generator that converts natural language to PostgreSQL".')
+    synth_seed = synth_p.add_mutually_exclusive_group()
+    synth_seed.add_argument("--seed-prompts", nargs="*", default=[], metavar="PROMPT",
+        help="Seed example prompts / inputs (space-separated). Guides style and structure. Optional if --description is detailed.")
+    synth_seed.add_argument("--seed-prompts-file", metavar="PATH",
+        help="Path to a text file with seed prompts, one per line. Empty lines are ignored.")
+    synth_p.add_argument("--num-cases", type=int, default=10,
+        help="Number of test cases to generate (default: 10).")
+    synth_p.add_argument("--model", default=None,
+        help='Model client for synthesis, as "module:callable" (e.g. "my_llm:generate"). '
+             "Callable must accept (prompt: str) -> str. "
+             "Also reads SYNTHESIS_MODEL env var.")
+    synth_p.add_argument("--output", "-o", default="synthetic_dataset.json",
+        help="Output path for the generated dataset JSON (default: synthetic_dataset.json).")
+    synth_p.add_argument("--case-id-prefix", default="synth",
+        help='Prefix for generated case IDs (default: "synth" → synth_001, synth_002, …).')
+    synth_p.add_argument("--interactive", "-i", action="store_true",
+        help="Review, edit, accept, or reject generated test cases interactively before saving. "
+             "Opens a terminal UI for human-in-the-loop curation.")
     return p
 
 
@@ -177,7 +203,8 @@ def _cmd_run(args: argparse.Namespace) -> int:
         requested = ["exact_match", "keyword", "contains", "semantic"]
     unknown = [e for e in requested if e not in EVALUATOR_REGISTRY]
     if unknown:
-        print(f"Error: unknown evaluator(s): {', '.join(unknown)}\nAvailable: {', '.join(sorted(EVALUATOR_REGISTRY.keys()))}", file=sys.stderr)
+        print(f"Error: unknown evaluator(s): {', '.join(unknown)}\n"
+              f"Available: {', '.join(sorted(EVALUATOR_REGISTRY.keys()))}", file=sys.stderr)
         return 2
     evaluators = []
     for name in requested:
@@ -200,25 +227,25 @@ def _cmd_run(args: argparse.Namespace) -> int:
     except Exception as e:
         print(f"Error loading dataset {dataset_path}: {e}", file=sys.stderr)
         return 2
-    print(f"Loaded {len(dataset)} test case(s) from {dataset_path}\nEvaluators: {', '.join(requested)}\nGenerator: {generator_fn.__module__}.{getattr(generator_fn, '__name__', '<callable>')}")
+    print(f"Loaded {len(dataset)} test case(s) from {dataset_path}\n"
+          f"Evaluators: {', '.join(requested)}\n"
+          f"Generator: {generator_fn.__module__}.{getattr(generator_fn, '__name__', '<callable>')}")
     runner = ExperimentRunner(evaluators)
     try:
         suite = runner.run_suite(dataset, generator_fn, continue_on_error=not args.fail_fast, verbose=True)
     except Exception as e:
         print(f"\nExperiment failed: {e}", file=sys.stderr)
         return 1
-    print(f"\nSuite complete — {suite.successful_cases}/{suite.total_cases} passed, {suite.failed_cases} failed, {suite.total_runtime_s:.2f}s total")
+    print(f"\nSuite complete — {suite.successful_cases}/{suite.total_cases} passed, "
+          f"{suite.failed_cases} failed, {suite.total_runtime_s:.2f}s total")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     formats = {f.strip().lower() for f in args.formats.split(",") if f.strip()}
     valid_formats = {"csv", "json", "md"}
     invalid = formats - valid_formats
     if invalid:
-        print(f"Warning: ignoring unknown format(s): {', '.join(sorted(invalid))}\nValid formats: {', '.join(sorted(valid_formats))}", file=sys.stderr)
+        print(f"Warning: ignoring unknown format(s): {', '.join(sorted(invalid))}", file=sys.stderr)
         formats &= valid_formats
-    if not formats:
-        print("No valid output formats specified — nothing to write.")
-        return 0
     written: list[str] = []
     if "json" in formats:
         json_path = output_dir / "results.json"
@@ -232,9 +259,72 @@ def _cmd_run(args: argparse.Namespace) -> int:
         md_path = output_dir / "report.md"
         generate_markdown_report(suite, str(md_path))
         written.append(str(md_path))
-    print("\nOutputs written:")
-    for path in written:
-        print(f"  {path}")
+    if written:
+        print("\nOutputs written:")
+        for path in written:
+            print(f"  {path}")
+    comparison_exit_code = 0
+    if getattr(args, "compare_with", None):
+        baseline_path = Path(args.compare_with)  # type: ignore[attr-defined]
+        if not baseline_path.exists():
+            print(f"\nError: baseline file not found: {baseline_path}", file=sys.stderr)
+            return 2
+        print(f"\n{'─' * 60}\nRegression comparison: {baseline_path.name} → current run\n{'─' * 60}")
+        try:
+            baseline_suite = load_suite_result(str(baseline_path))
+            comparison = compare_suites(
+                suite, baseline_suite,
+                latency_regression_threshold=args.latency_regression_factor,  # type: ignore[attr-defined]
+                score_drop_threshold=args.score_drop_threshold,  # type: ignore[attr-defined]
+            )
+        except Exception as e:
+            print(f"Error comparing suites: {e}", file=sys.stderr)
+            return 2
+        summary = comparison["summary"]
+        metrics_drift = comparison["metrics_drift"]
+        score_drops = comparison["score_drops"]
+        latency_regressions = comparison["latency_regressions"]
+        print(f"Cases: baseline={summary['baseline_cases']}, "
+              f"current={summary['current_cases']}, common={summary['common_cases']}")
+        print("\nMetrics drift:")
+        if metrics_drift:
+            for eval_name in sorted(metrics_drift.keys()):
+                d = metrics_drift[eval_name]
+                mean_delta = d["mean_delta"]
+                icon = "🟢" if mean_delta >= 0.01 else "⚪" if mean_delta >= -0.01 else "🟡" if mean_delta >= -0.05 else "🔴"
+                print(f"  {icon} {eval_name}: mean {mean_delta:+.4f}, "
+                      f"median {d['median_delta']:+.4f}, "
+                      f"↑{d['improved']} ↓{d['regressed']} ＝{d['unchanged']}")
+        else:
+            print("  (no comparable scores)")
+        if score_drops:
+            print(f"\n⚠️  Score drops (>{args.score_drop_threshold}): {len(score_drops)} case(s)")
+            for drop in score_drops[:10]:
+                print(f"  🔴 {drop['case_id']} / {drop['evaluator']}: "
+                      f"{drop['baseline_score']:.3f} → {drop['current_score']:.3f} ({drop['delta']:+.3f})")
+            if len(score_drops) > 10:
+                print(f"  … +{len(score_drops) - 10} more")
+            comparison_exit_code = 3
+        else:
+            print(f"\n✅ No score drops > {args.score_drop_threshold}")
+        if latency_regressions:
+            pct = (args.latency_regression_factor - 1.0) * 100  # type: ignore[attr-defined]
+            print(f"\n⚠️  Latency regressions (>{pct:.0f}% slower): {len(latency_regressions)} case(s)")
+            for reg in latency_regressions[:10]:
+                print(f"  ⏱️  {reg['case_id']}: {reg['baseline_ms']:.1f}ms → {reg['current_ms']:.1f}ms "
+                      f"({reg['factor']:.2f}×)")
+            if len(latency_regressions) > 10:
+                print(f"  … +{len(latency_regressions) - 10} more")
+            comparison_exit_code = 3
+        else:
+            pct = (args.latency_regression_factor - 1.0) * 100  # type: ignore[attr-defined]
+            print(f"\n✅ No latency regressions > {pct:.0f}%")
+        comparison_md_path = output_dir / "comparison.md"
+        try:
+            generate_comparison_report(comparison, str(comparison_md_path))
+            print(f"\n📊 Comparison report: {comparison_md_path}")
+        except Exception as e:
+            print(f"\nWarning: failed to write comparison report: {e}", file=sys.stderr)
     if args.archive:
         archive_dir = args.archive if isinstance(args.archive, str) else "archives"
         print(f"\n📦 Archiving run artifacts to {archive_dir}/ ...")
@@ -243,7 +333,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             print(f"✅ Archive created: {archive_path}")
         except Exception as e:
             print(f"⚠️  Archiving failed: {e}", file=sys.stderr)
-    return 0
+    return comparison_exit_code
 
 
 def _cmd_synthesize(args: argparse.Namespace) -> int:
@@ -263,7 +353,13 @@ def _cmd_synthesize(args: argparse.Namespace) -> int:
         seed_prompts = list(args.seed_prompts or [])
     model_spec = args.model or os.environ.get("SYNTHESIS_MODEL")
     if not model_spec:
-        print("Error: synthesize requires a model client.\nPass --model <module:callable> on the command line, or set the SYNTHESIS_MODEL environment variable.", file=sys.stderr)
+        print(
+            "Error: synthesize requires a model client.\n"
+            "Pass --model <module:callable> or set SYNTHESIS_MODEL env var, e.g.:\n"
+            '  export SYNTHESIS_MODEL="my_llm:generate"\n'
+            '  prompt_metrics synthesize --description "..." --model my_llm:generate',
+            file=sys.stderr,
+        )
         return 2
     try:
         model_client = _resolve_callable(model_spec, kind="synthesis model")
@@ -273,10 +369,18 @@ def _cmd_synthesize(args: argparse.Namespace) -> int:
     if args.num_cases < 1:
         print("Error: --num-cases must be >= 1", file=sys.stderr)
         return 2
-    print(f"Synthesizing {args.num_cases} test case(s)...\nDescription: {args.description[:120]}" + ("…" if len(args.description) > 120 else "") + f"\nSeed prompts: {len(seed_prompts)}\nModel: {model_spec}\n")
+    print(f"Synthesizing {args.num_cases} test case(s)...\n"
+          f"Description: {args.description[:120]}"
+          + ("…" if len(args.description) > 120 else "") +
+          f"\nSeed prompts: {len(seed_prompts)}\n"
+          f"Model: {model_spec}\n")
     synthesizer = DatasetSynthesizer(model_client=model_client, case_id_prefix=args.case_id_prefix)  # type: ignore[arg-type]
     try:
-        dataset = synthesizer.generate_dataset(seed_prompts=seed_prompts, description=args.description, num_cases=args.num_cases)
+        dataset = synthesizer.generate_dataset(
+            seed_prompts=seed_prompts,
+            description=args.description,
+            num_cases=args.num_cases,
+        )
     except Exception as e:
         print(f"\nSynthesis failed: {e}", file=sys.stderr)
         return 1
@@ -287,7 +391,6 @@ def _cmd_synthesize(args: argparse.Namespace) -> int:
             dataset = reviewer.review_interactively()
         except (KeyboardInterrupt, EOFError):
             print("\n\n⚠️  Curation interrupted.", file=sys.stderr)
-            print("Curation cancelled by user.", file=sys.stderr)
             return 130
         if not dataset:
             print("\n⚠️  All cases were rejected. Nothing to save.", file=sys.stderr)
@@ -301,9 +404,16 @@ def _cmd_synthesize(args: argparse.Namespace) -> int:
     except Exception as e:
         print(f"Error writing dataset to {output_path}: {e}", file=sys.stderr)
         return 1
-    print(f"✅ {'Curated' if args.interactive else 'Generated'} {len(dataset)} test case(s)\n   Output: {output_path}\n   Case IDs: {dataset[0]['id'] if dataset else '(none)'}" + (f" … {dataset[-1]['id']}" if len(dataset) > 1 else "") + f"\n\nRun your evaluation with:\n  prompt_metrics run --dataset {output_path}")
+    print(
+        f"✅ {'Curated' if args.interactive else 'Generated'} {len(dataset)} test case(s)\n"
+        f"   Output: {output_path}\n"
+        f"   Case IDs: {dataset[0]['id'] if dataset else '(none)'}"
+        + (f" … {dataset[-1]['id']}" if len(dataset) > 1 else "") +
+        f"\n\nRun your evaluation with:\n  prompt_metrics run --dataset {output_path}"
+    )
     if not args.interactive and len(dataset) < args.num_cases:
-        print(f"\n⚠️  Warning: requested {args.num_cases} cases, but only {len(dataset)} were generated.", file=sys.stderr)
+        print(f"\n⚠️  Warning: requested {args.num_cases} cases, but only {len(dataset)} were generated.",
+              file=sys.stderr)
     return 0
 
 
@@ -313,7 +423,9 @@ def main(argv: list[str] | None = None) -> int:
     if argv_list:
         first = argv_list[0]
         if first not in ("run", "synthesize", "-h", "--help"):
-            run_flags = ("--dataset", "--output-dir", "--evaluators", "--formats", "--generator", "--judge-model", "--embedding-model", "--fail-fast", "--archive")
+            run_flags = ("--dataset", "--output-dir", "--evaluators", "--formats",
+                         "--generator", "--judge-model", "--embedding-model",
+                         "--fail-fast", "--archive", "--compare-with")
             if first.startswith("-") or any(f in argv_list for f in run_flags):
                 argv_list = ["run"] + argv_list
     args = parser.parse_args(argv_list if argv is not None else None)
