@@ -1,194 +1,208 @@
+# src/prompt_metrics/export.py
+"""
+Experiment result export utilities.
+
+Supports JSON and flattened CSV output for downstream analysis
+(e.g. pandas DataFrames, notebook ingestion).
+"""
+
 from __future__ import annotations
-import json
+
 import csv
-from typing import Any, Dict, List, Union
+import json
+from typing import Any, Iterable
 
-def flatten_dict(d: Any, parent_key: str = "", sep: str = "_") -> Dict[str, Any]:
+
+# ---------------------------------------------------------------------------
+# Flattening
+# ---------------------------------------------------------------------------
+
+def flatten_dict(
+    obj: Any,
+    parent_key: str = "",
+    sep: str = "_",
+) -> dict[str, Any]:
     """
-    Recursively flatten nested dicts/lists into a single-level dict.
+    Recursively flatten a nested dict/list structure into a flat dict.
 
-    - dict keys are joined with `sep`
-    - lists are indexed numerically: key_0, key_1, ...
-    - lists containing only primitives also produce a joined string
-      at the base key (semicolon-separated) to preserve a convenient
-      flat column (e.g. `keywords` -> "key1; key2"), while still
-      emitting indexed entries (keywords_0, keywords_1, ...).
+    Example:
+        {"evaluator_a": {"score": 0.8, "passed": true}}
+        → {"evaluator_a_score": 0.8, "evaluator_a_passed": true}
+
+    Lists are indexed: {"flags": [{"level": "SEV1"}]}
+        → {"flags_0_level": "SEV1"}
     """
-    items: Dict[str, Any] = {}
+    items: dict[str, Any] = {}
 
-    if isinstance(d, dict):
-        for k, v in d.items():
+    if isinstance(obj, dict):
+        for k, v in obj.items():
             new_key = f"{parent_key}{sep}{k}" if parent_key else k
-            items.update(flatten_dict(v, new_key, sep=sep))
-        return items
+            if isinstance(v, (dict, list)):
+                items.update(flatten_dict(v, new_key, sep=sep))
+            else:
+                items[new_key] = v
 
-    if isinstance(d, list):
-        # If list is primitive-only, store a joined convenience copy
-        if d and all(not isinstance(x, (dict, list)) for x in d):
-            items[parent_key] = "; ".join("" if x is None else str(x) for x in d)
-        elif not d and parent_key:
-            # empty list -> explicit empty value at base key
-            items[parent_key] = ""
-        for i, v in enumerate(d):
-            new_key = f"{parent_key}{sep}{i}" if parent_key else str(i)
-            items.update(flatten_dict(v, new_key, sep=sep))
-        return items
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            new_key = f"{parent_key}{sep}{i}"
+            if isinstance(v, (dict, list)):
+                items.update(flatten_dict(v, new_key, sep=sep))
+            else:
+                items[new_key] = v
+    else:
+        # Scalar value at root — shouldn't normally happen, but handle it
+        items[parent_key or "value"] = obj
 
-    # primitive
-    if parent_key:
-        items[parent_key] = d
     return items
 
 
-def _normalize_cases(results: Any) -> tuple[List[Dict[str, Any]], Dict[str, Any] | None]:
-    """
-    Accepts:
-      - SuiteResult instance
-      - CaseResult instance
-      - list[CaseResult]
-      - list[dict]
-      - dict with {"results": [...], "metadata": {...}}
-      - single dict case
-    Returns: (cases: list[dict], suite_meta: dict | None)
-    """
-    # SuiteResult duck-type: has .to_dict() and .results attribute (list)
-    if hasattr(results, "to_dict") and hasattr(results, "results") and isinstance(getattr(results, "results"), list):
-        suite_dict = results.to_dict()
-        return suite_dict.get("results", []), suite_dict.get("metadata")
+# ---------------------------------------------------------------------------
+# Serialisation helpers
+# ---------------------------------------------------------------------------
 
-    # CaseResult duck-type
-    if hasattr(results, "to_dict") and not hasattr(results, "results"):
-        return [results.to_dict()], None
+def _normalise_results(results: Any) -> list[dict[str, Any]]:
+    """
+    Accept CaseResult objects, SuiteResult objects, or raw dicts/lists,
+    and normalise to a flat list[dict] of case records.
+    """
+    # SuiteResult-like
+    if hasattr(results, "results") and isinstance(results.results, list):
+        results = results.results
 
+    # Single CaseResult
+    if hasattr(results, "to_dict") and callable(results.to_dict):
+        results = [results.to_dict()]
+
+    # List of CaseResult objects
+    if isinstance(results, list) and results and hasattr(results[0], "to_dict"):
+        results = [r.to_dict() for r in results]
+
+    # Already a list of dicts
     if isinstance(results, list):
-        if results and hasattr(results[0], "to_dict"):
-            return [r.to_dict() for r in results], None
-        # assume list[dict]
-        return results, None
+        return results
 
+    # Single dict
     if isinstance(results, dict):
+        # If it looks like a SuiteResult.to_dict() envelope, unwrap it
         if "results" in results and isinstance(results["results"], list):
-            return results["results"], results.get("metadata")
-        # single case dict
-        return [results], None
+            return results["results"]
+        return [results]
 
-    raise TypeError(f"export_results: unsupported results type {type(results)!r}")
+    raise TypeError(
+        f"export_results: unsupported results type {type(results)!r}. "
+        "Expected SuiteResult, CaseResult, list[CaseResult], or list[dict]."
+    )
 
+
+def _write_json(records: list[dict[str, Any]], output_path: str) -> None:
+    """Write records as pretty-printed JSON."""
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, ensure_ascii=False)
+
+
+def _write_csv(records: list[dict[str, Any]], output_path: str) -> None:
+    """Write records as a flattened CSV."""
+    if not records:
+        # Write an empty file with no header — caller can decide what to do
+        open(output_path, "w", encoding="utf-8").close()
+        return
+
+    # Flatten every row and collect the full column universe
+    flat_rows: list[dict[str, Any]] = []
+    all_columns: set[str] = set()
+
+    for rec in records:
+        flat = flatten_dict(rec)
+        flat_rows.append(flat)
+        all_columns.update(flat.keys())
+
+    # Stable column ordering:
+    # 1. Core case metadata first, 2. evaluator_results_*, 3. everything else
+    core_prefixes = (
+        "case_id",
+        "input_prompt",
+        "generated_response",
+        "expected_text",
+        "keywords",
+        "latency_ms",
+        "error",
+    )
+
+    def column_sort_key(col: str) -> tuple[int, str]:
+        for i, prefix in enumerate(core_prefixes):
+            if col == prefix or col.startswith(prefix + "_"):
+                return (i, col)
+        if col.startswith("evaluator_results_"):
+            return (len(core_prefixes), col)
+        if col.startswith("metadata_"):
+            return (len(core_prefixes) + 2, col)
+        return (len(core_prefixes) + 1, col)
+
+    fieldnames = sorted(all_columns, key=column_sort_key)
+
+    with open(output_path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in flat_rows:
+            # Scalar-serialise complex leftovers (shouldn't happen post-flatten,
+            # but be defensive)
+            serialised = {
+                k: (json.dumps(v) if isinstance(v, (dict, list)) else v)
+                for k, v in row.items()
+            }
+            writer.writerow(serialised)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def export_results(
     results: Any,
     output_path: str,
-    format: str = "json"
+    format: str = "json",
 ) -> str:
     """
-    Export suite/case results to JSON or CSV.
+    Export experiment results to disk.
 
-    Parameters
-    ----------
-    results: SuiteResult | CaseResult | list[CaseResult] | list[dict] | dict
-        Results object(s) to export. Automatically normalized.
-    output_path: str
-        Destination file path.
-    format: str, default "json"
-        "json" or "csv".
+    Args:
+        results: One of:
+            - SuiteResult
+            - CaseResult
+            - list[CaseResult]
+            - list[dict]  (case records)
+            - dict        (single case record, or SuiteResult.to_dict() envelope)
+        output_path: Destination file path.
+        format: "json" | "csv"
+            - json: Flat array of case record dicts, pretty-printed.
+            - csv:  Fully flattened table. Nested keys in evaluator_results
+                    become separate columns:
+                    evaluator_results.exact_match.score
+                    → evaluator_results_exact_match_score
+                    Lists are indexed:
+                    severity_flags[0].level
+                    → evaluator_results_..._severity_flags_0_level
+                    Ideal for pd.read_csv().
 
-    Returns
-    -------
-    str
-        The output_path written.
+    Returns:
+        The output_path that was written.
 
-    CSV flattening:
-      - Nested dicts are exploded: evaluator_results_exact_match_score, ...
-      - Lists are indexed: evaluator_results_..._dimension_scores_0_raw_score
-      - Primitive lists also produce a joined base column (e.g. keywords)
-      - Column order: core metadata first, then evaluator_results_*, metadata_*, then remaining
+    Raises:
+        ValueError: If format is not "json" or "csv".
+        TypeError:  If results is not a recognised type.
     """
-    fmt = format.lower()
+    fmt = format.lower().strip()
     if fmt not in {"json", "csv"}:
-        raise ValueError(f"format must be 'json' or 'csv', got {format!r}")
+        raise ValueError(f'format must be "json" or "csv", got {format!r}')
 
-    cases, meta = _normalize_cases(results)
+    records = _normalise_results(results)
 
     if fmt == "json":
-        payload: Any
-        if meta is not None:
-            payload = {"metadata": meta, "results": cases}
-        else:
-            # Preserve suite shape even without metadata
-            payload = {"results": cases}
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
-        return output_path
-
-    # CSV path
-    flat_rows: List[Dict[str, Any]] = [flatten_dict(case) for case in cases]
-
-    # Inject suite-level metadata as metadata_* columns (if present)
-    if meta:
-        flat_meta = flatten_dict(meta, parent_key="metadata")
-        for row in flat_rows:
-            row.update(flat_meta)
-
-    # Collect all keys
-    all_keys: set[str] = set()
-    for row in flat_rows:
-        all_keys.update(row.keys())
-
-    # Stable column ordering
-    # Core fields (support both singular and plural variants from different runner versions)
-    core_priority = [
-        "case_id",
-        "input_prompt",
-        "generated_response",
-        "output_text",  # legacy alias
-        "expected_text",
-        "keywords",
-        "latency_ms",
-        "latencies_ms",
-        "error",
-        "errors",
-    ]
-    # Expand core list with indexed keyword columns keywords_0, keywords_1 ... if present,
-    # keeping them immediately after `keywords`
-    ordered: List[str] = []
-    def push_if_present(key: str):
-        if key in all_keys and key not in ordered:
-            ordered.append(key)
-
-    for key in core_priority:
-        push_if_present(key)
-
-    # Push keywords_N, latency_N, etc., right after their base key
-    for base in ["keywords", "latencies_ms", "errors"]:
-        indexed = sorted([k for k in all_keys if k.startswith(f"{base}_")])
-        for k in indexed:
-            push_if_present(k)
-
-    # Next: evaluator_results_*
-    eval_keys = sorted([k for k in all_keys if k.startswith("evaluator_results_") or k.startswith("evaluator_results")])
-    for k in eval_keys:
-        push_if_present(k)
-
-    # Next: scores_* (legacy runner field name)
-    score_keys = sorted([k for k in all_keys if k.startswith("scores_")])
-    for k in score_keys:
-        push_if_present(k)
-
-    # Next: metadata_*
-    meta_keys = sorted([k for k in all_keys if k.startswith("metadata_")])
-    for k in meta_keys:
-        push_if_present(k)
-
-    # Finally: everything else, alphabetically
-    remaining = sorted(all_keys - set(ordered))
-    ordered.extend(remaining)
-
-    # Write CSV
-    with open(output_path, "w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=ordered, extrasaction="ignore")
-        writer.writeheader()
-        for row in flat_rows:
-            # Normalize None -> ""
-            writer.writerow({k: ("" if row.get(k) is None else row.get(k, "")) for k in ordered})
+        _write_json(records, output_path)
+    else:  # csv
+        _write_csv(records, output_path)
 
     return output_path
+
+
+__all__ = ["export_results", "flatten_dict"]
