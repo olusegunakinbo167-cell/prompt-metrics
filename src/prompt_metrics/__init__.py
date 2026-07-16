@@ -1,11 +1,15 @@
 # src/prompt_metrics/__init__.py
 from .evaluators import (
     ContainsEvaluator,
+    CritiqueEvaluator,
     Evaluator,
     EvaluatorAdapter,
     ExactMatchEvaluator,
     KeywordEvaluator,
+    ModelEvaluator,
+    QAEvaluator,
     RegexMatchEvaluator,
+    RUBRIC_TEMPLATES,
 )
 from .export import export_results, flatten_dict
 from .reports import generate_markdown_report
@@ -28,11 +32,17 @@ __all__ = [
     "export_results",
     "flatten_dict",
     "generate_markdown_report",
-    # Evaluators
+    # Evaluators — base
     "Evaluator",
     "EvaluatorAdapter",
+    "ModelEvaluator",
+    # Evaluators — text
     "ExactMatchEvaluator",
     "KeywordEvaluator",
     "RegexMatchEvaluator",
     "ContainsEvaluator",
+    # Evaluators — model-based
+    "QAEvaluator",
+    "CritiqueEvaluator",
+    "RUBRIC_TEMPLATES",
 ]
