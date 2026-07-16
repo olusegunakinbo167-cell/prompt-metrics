@@ -60,7 +60,7 @@ def _extract_numeric_score(result: Any) -> float | None:
 def _format_score_badge(score: float | None, width: int = 12) -> str:
     """Render a score as a visual badge: `🟢 0.850` / `🟡 0.620` / `🔴 0.310` / `—`."""
     if score is None:
-        return "` — `"
+        return "` — `" 
     if score >= 0.8:
         icon = "🟢"
     elif score >= 0.5:
@@ -327,4 +327,217 @@ def generate_markdown_report(
     return output_path
 
 
-__all__ = ["generate_markdown_report"]
+# ---------------------------------------------------------------------------
+# Comparison / regression reporting
+# ---------------------------------------------------------------------------
+
+def _fmt_delta(delta: float | None, *, signed: bool = True) -> str:
+    """Format a score delta with sign and color emoji."""
+    if delta is None:
+        return "—"
+    sign = "+" if (signed and delta >= 0) else ""
+    if delta >= 0.05:
+        icon = "🟢"
+    elif delta >= -0.01:
+        icon = "⚪"
+    elif delta >= -0.15:
+        icon = "🟡"
+    else:
+        icon = "🔴"
+    return f"{icon} {sign}{delta:.3f}"
+
+
+def _fmt_score(score: float | None) -> str:
+    """Format a score value."""
+    if score is None:
+        return "—"
+    return f"{score:.3f}"
+
+
+def generate_comparison_report(
+    comparison_result: dict[str, Any],
+    output_path: str,
+    *,
+    title: str = "Regression Report — Baseline vs Current",
+    baseline_label: str = "Baseline",
+    current_label: str = "Current",
+) -> str:
+    """
+    Generate a Markdown comparison report from a compare_suites() result.
+
+    Args:
+        comparison_result: Output dict from compare_suites().
+        output_path: Destination .md file path.
+        title: Report title (H1).
+        baseline_label: Label for the baseline run in tables.
+        current_label: Label for the current run in tables.
+
+    Returns:
+        The output_path that was written.
+    """
+    summary = comparison_result.get("summary", {})
+    metrics_drift = comparison_result.get("metrics_drift", {})
+    score_drops = comparison_result.get("score_drops", [])
+    latency_regressions = comparison_result.get("latency_regressions", [])
+    per_case = comparison_result.get("per_case", {})
+
+    lines: list[str] = []
+    lines.append(f"# {title}")
+    lines.append("")
+
+    current_cases = summary.get("current_cases", 0)
+    baseline_cases = summary.get("baseline_cases", 0)
+    common_cases = summary.get("common_cases", 0)
+    new_cases = summary.get("new_cases", [])
+    missing_cases = summary.get("missing_cases", [])
+    total_score_drops = summary.get("total_score_drops", len(score_drops))
+    total_latency_regressions = summary.get("total_latency_regressions", len(latency_regressions))
+    score_threshold = summary.get("score_drop_threshold", 0.15)
+    latency_threshold = summary.get("latency_regression_threshold", 1.2)
+
+    has_regressions = total_score_drops > 0 or total_latency_regressions > 0
+    if has_regressions:
+        lines.append(f"> ⚠️ **Regressions detected:** {total_score_drops} score drop(s), {total_latency_regressions} latency regression(s)")
+    else:
+        lines.append("> ✅ **No regressions detected** — all metrics stable or improved")
+    lines.append("")
+    lines.append("## Summary")
+    lines.append("")
+    lines.append("| Metric | Value |")
+    lines.append("|---|---:|")
+    lines.append(f"| {baseline_label} cases | {baseline_cases} |")
+    lines.append(f"| {current_label} cases | {current_cases} |")
+    lines.append(f"| Common cases | {common_cases} |")
+    lines.append(f"| New cases | {len(new_cases)} |")
+    lines.append(f"| Missing cases | {len(missing_cases)} |")
+    lines.append(f"| Score drops (>{score_threshold}) | {total_score_drops} |")
+    lines.append(f"| Latency regressions (>{(latency_threshold-1)*100:.0f}%) | {total_latency_regressions} |")
+    lines.append("")
+
+    if new_cases:
+        lines.append(f"**New cases:** " + ", ".join(f"`{c}`" for c in new_cases[:10]) + (f" … +{len(new_cases)-10} more" if len(new_cases) > 10 else ""))
+        lines.append("")
+    if missing_cases:
+        lines.append(f"**Missing cases:** " + ", ".join(f"`{c}`" for c in missing_cases[:10]) + (f" … +{len(missing_cases)-10} more" if len(missing_cases) > 10 else ""))
+        lines.append("")
+
+    # Metrics Drift
+    lines.append("## Metrics Drift")
+    lines.append("")
+    if metrics_drift:
+        lines.append("| Evaluator | Mean Δ | Median Δ | Min Δ | Max Δ | Stdev | Improved | Regressed | Unchanged | N |")
+        lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for eval_name in sorted(metrics_drift.keys()):
+            s = metrics_drift[eval_name]
+            lines.append(
+                f"| `{eval_name}` | {_fmt_delta(s.get('mean_delta', 0.0))} | {_fmt_delta(s.get('median_delta', 0.0))} | "
+                f"{_fmt_delta(s.get('min_delta', 0.0))} | {_fmt_delta(s.get('max_delta', 0.0))} | "
+                f"{s.get('stdev_delta', 0.0):.3f} | {s.get('improved', 0)} | {s.get('regressed', 0)} | "
+                f"{s.get('unchanged', 0)} | {s.get('count', 0)} |"
+            )
+    else:
+        lines.append("_No comparable evaluator scores found._")
+    lines.append("")
+
+    # Score Drops
+    lines.append("## Score Drops")
+    lines.append("")
+    if score_drops:
+        lines.append(f"_Cases where score dropped by more than {score_threshold}:_")
+        lines.append("")
+        lines.append(f"| Case | Evaluator | {baseline_label} | {current_label} | Δ |")
+        lines.append("|---|---|---:|---:|---:|")
+        for drop in score_drops[:50]:
+            lines.append(
+                f"| `{drop['case_id']}` | `{drop['evaluator']}` | {_fmt_score(drop['baseline_score'])} | "
+                f"{_fmt_score(drop['current_score'])} | {_fmt_delta(drop['delta'], signed=True)} |"
+            )
+        if len(score_drops) > 50:
+            lines.append(f"| … | … | … | … | _{len(score_drops) - 50} more_ |")
+    else:
+        lines.append(f"_No score drops exceeding the {score_threshold} threshold._ ✅")
+    lines.append("")
+
+    # Latency Regressions
+    lines.append("## Latency Regressions")
+    lines.append("")
+    if latency_regressions:
+        pct_thresh = (latency_threshold - 1.0) * 100
+        lines.append(f"_Cases where latency increased by more than {pct_thresh:.0f}%:_")
+        lines.append("")
+        lines.append(f"| Case | {baseline_label} (ms) | {current_label} (ms) | Δ (ms) | Factor |")
+        lines.append("|---|---:|---:|---:|---:|")
+        for reg in latency_regressions[:50]:
+            factor = reg["factor"]
+            icon = "🔴" if factor >= 2.0 else "🟡" if factor >= 1.5 else "⚪"
+            lines.append(
+                f"| `{reg['case_id']}` | {reg['baseline_ms']:.1f} | {reg['current_ms']:.1f} | "
+                f"{reg['delta_ms']:+.1f} | {icon} {factor:.2f}× |"
+            )
+        if len(latency_regressions) > 50:
+            lines.append(f"| … | … | … | … | _{len(latency_regressions) - 50} more_ |")
+    else:
+        pct_thresh = (latency_threshold - 1.0) * 100
+        lines.append(f"_No latency regressions exceeding the {pct_thresh:.0f}% threshold._ ✅")
+    lines.append("")
+
+    # Per-Case Comparison
+    lines.append("## Per-Case Comparison")
+    lines.append("")
+    all_evals: set[str] = set()
+    for case_data in per_case.values():
+        all_evals.update(case_data.get("evaluators", {}).keys())
+    all_evals = sorted(all_evals)
+
+    if not per_case:
+        lines.append("_No cases to compare._")
+    elif all_evals:
+        eval_headers = " | ".join(f"{e}" for e in all_evals)
+        lines.append(f"| Case | Latency | {eval_headers} |")
+        lines.append("|---|---:|" + "|".join([":---:"] * len(all_evals)) + "|")
+        for case_id in sorted(per_case.keys()):
+            cd = per_case[case_id]
+            lat_factor = cd.get("latency_factor")
+            if lat_factor is None:
+                lat_cell = "—"
+            elif cd.get("latency_regression"):
+                lat_cell = f"🔴 {lat_factor:.2f}×"
+            elif lat_factor > 1.05:
+                lat_cell = f"🟡 {lat_factor:.2f}×"
+            else:
+                lat_cell = f"{lat_factor:.2f}×"
+            eval_cells = []
+            for ev in all_evals:
+                ed = cd.get("evaluators", {}).get(ev, {})
+                base = ed.get("baseline")
+                curr = ed.get("current")
+                delta = ed.get("delta")
+                score_drop = ed.get("score_drop", False)
+                if base is None and curr is None:
+                    eval_cells.append("—")
+                elif base is None:
+                    eval_cells.append(f"— → {_fmt_score(curr)}")
+                elif curr is None:
+                    eval_cells.append(f"{_fmt_score(base)} → —")
+                else:
+                    d_str = f" ({delta:+.3f})" if delta is not None else ""
+                    cell = f"{base:.3f} → {curr:.3f}{d_str}"
+                    if score_drop:
+                        cell = "🔴 " + cell
+                    elif delta is not None and delta > 0.05:
+                        cell = "🟢 " + cell
+                    eval_cells.append(cell)
+            case_label = f"`{case_id}`"
+            if cd.get("is_new"):
+                case_label += " 🆕"
+            if cd.get("is_missing"):
+                case_label += " ⚠️ missing"
+            lines.append(f"| {case_label} | {lat_cell} | " + " | ".join(eval_cells) + " |")
+    lines.append("")
+    markdown = "\n".join(lines)
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(markdown)
+    return output_path
+
+
+__all__ = ["generate_markdown_report", "generate_comparison_report"]

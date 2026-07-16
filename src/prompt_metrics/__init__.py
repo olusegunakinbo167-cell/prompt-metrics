@@ -17,7 +17,7 @@ from .export import export_results, flatten_dict
 from .monitoring import compare_suites, load_suite_result
 from .curation import CurationReviewer
 from .archiver import create_run_archive
-from .reports import generate_markdown_report
+from .reports import generate_comparison_report, generate_markdown_report
 from .runner import (
     ExperimentRunner,
     CaseResult,
@@ -38,6 +38,7 @@ __all__ = [
     "export_results",
     "flatten_dict",
     "generate_markdown_report",
+    "generate_comparison_report",
     "create_run_archive",
     # Evaluators — base
     "Evaluator",
