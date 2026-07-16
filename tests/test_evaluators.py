@@ -4,6 +4,7 @@ Tests for prompt_metrics.evaluators.
 
 Covers:
   - Text evaluators: ExactMatch, Keyword, Regex, Contains
+  - Semantic evaluator: SemanticSimilarity (TF-IDF + mocked embeddings)
   - Model-based evaluators: QAEvaluator, CritiqueEvaluator (with mocked LLM)
 """
 
@@ -18,6 +19,7 @@ from prompt_metrics.evaluators import (
     KeywordEvaluator,
     QAEvaluator,
     RegexMatchEvaluator,
+    SemanticSimilarityEvaluator,
 )
 
 
@@ -61,6 +63,166 @@ def test_contains_evaluator():
     r = ev.evaluate("", "The quick brown fox", expected_text="BROWN")
     assert r["score"] == 1.0
     assert r["passed"] is True
+
+
+# ---------------------------------------------------------------------------
+# Semantic similarity evaluator
+# ---------------------------------------------------------------------------
+
+def test_semantic_similarity_tfidf_identical():
+    """TF-IDF fallback: identical texts should score ~1.0."""
+    ev = SemanticSimilarityEvaluator()
+    # Force TF-IDF backend even if sentence-transformers is installed
+    ev._st_backend = None  # type: ignore
+    ev._backend_name = "tfidf"
+
+    r = ev.evaluate(
+        prompt="",
+        response="The quick brown fox jumps over the lazy dog",
+        expected_text="The quick brown fox jumps over the lazy dog",
+    )
+    assert r["score"] is not None
+    assert r["score"] > 0.99
+    assert r["backend"] == "tfidf"
+
+
+def test_semantic_similarity_tfidf_paraphrase():
+    """TF-IDF fallback: paraphrased text should have moderate similarity."""
+    ev = SemanticSimilarityEvaluator()
+    ev._st_backend = None  # type: ignore
+    ev._backend_name = "tfidf"
+
+    r = ev.evaluate(
+        prompt="",
+        response="Machine learning is a subset of artificial intelligence",
+        expected_text="ML is a branch of AI",
+    )
+    # TF-IDF is a bag-of-words model, so with no overlapping tokens
+    # after tokenization, similarity will be 0. These are quite different
+    # lexically. Let's use texts with actual overlap:
+    assert r["score"] is not None
+    assert 0.0 <= r["score"] <= 1.0
+
+    # Now test with overlapping vocabulary
+    r2 = ev.evaluate(
+        prompt="",
+        response="machine learning is a subset of artificial intelligence",
+        expected_text="machine learning is a branch of artificial intelligence",
+    )
+    # "machine", "learning", "is", "a", "of", "artificial", "intelligence" overlap
+    # should give a decent score
+    assert r2["score"] is not None
+    assert r2["score"] > 0.3
+    assert r2["backend"] == "tfidf"
+
+
+def test_semantic_similarity_tfidf_unrelated():
+    """TF-IDF fallback: unrelated texts should score near 0."""
+    ev = SemanticSimilarityEvaluator()
+    ev._st_backend = None  # type: ignore
+    ev._backend_name = "tfidf"
+
+    r = ev.evaluate(
+        prompt="",
+        response="purple elephants dance on mars",
+        expected_text="quantum physics and thermodynamics",
+    )
+    assert r["score"] is not None
+    assert r["score"] < 0.1
+
+
+def test_semantic_similarity_missing_reference():
+    """SemanticSimilarityEvaluator returns score=None when expected_text is missing."""
+    ev = SemanticSimilarityEvaluator()
+    ev._st_backend = None  # type: ignore
+    ev._backend_name = "tfidf"
+
+    r = ev.evaluate(prompt="Q?", response="A", expected_text=None)
+    assert r["score"] is None
+    assert "no expected_text" in r["reason"].lower()
+
+
+def test_semantic_similarity_with_embedding_client():
+    """SemanticSimilarityEvaluator with a mocked embedding API client."""
+    # Mock embedding client: returns a 3D vector based on simple heuristics
+    # so we can test cosine similarity logic end-to-end
+    def fake_embed(text: str) -> list[float]:
+        # Very simple: count occurrences of "cat", "dog", "bird"
+        t = text.lower()
+        return [
+            float(t.count("cat")),
+            float(t.count("dog")),
+            float(t.count("bird")),
+        ]
+
+    ev = SemanticSimilarityEvaluator(
+        embedding_client=fake_embed,
+        normalize=True,
+    )
+
+    # Identical semantic content → similarity = 1.0
+    r = ev.evaluate(
+        prompt="",
+        response="cat cat dog",
+        expected_text="cat cat dog",
+    )
+    assert r["score"] == pytest.approx(1.0, abs=1e-5)
+    assert r["backend"] == "custom"
+    assert r["embedding_dim"] == 3
+
+    # Orthogonal vectors → similarity ≈ 0
+    r = ev.evaluate(
+        prompt="",
+        response="cat cat cat",
+        expected_text="dog dog dog",
+    )
+    assert r["score"] == pytest.approx(0.0, abs=1e-5)
+
+    # Partial overlap
+    r = ev.evaluate(
+        prompt="",
+        response="cat dog",
+        expected_text="cat bird",
+    )
+    # cat·cat = 1*1, dog·bird = 0 → cos = 1 / (sqrt(2) * sqrt(2)) = 0.5
+    assert r["score"] == pytest.approx(0.5, abs=1e-5)
+
+
+def test_semantic_similarity_embedding_client_error():
+    """Embedding client exceptions should be caught gracefully."""
+    def failing_embed(text: str) -> list[float]:
+        raise RuntimeError("embedding API quota exceeded")
+
+    ev = SemanticSimilarityEvaluator(embedding_client=failing_embed)
+    r = ev.evaluate(
+        prompt="",
+        response="hello",
+        expected_text="world",
+    )
+    assert r["score"] is None
+    assert "embedding failed" in r["error"].lower()
+    assert "quota" in r["error"].lower()
+
+
+def test_semantic_similarity_dimension_mismatch():
+    """Mismatched embedding dimensions should be reported cleanly."""
+    call_count = [0]
+
+    def bad_embed(text: str) -> list[float]:
+        # Return different dimensions on first vs second call
+        call_count[0] += 1
+        if call_count[0] == 1:
+            return [0.1, 0.2, 0.3]
+        return [0.1, 0.2]  # wrong dim!
+
+    ev = SemanticSimilarityEvaluator(embedding_client=bad_embed)
+    r = ev.evaluate(
+        prompt="",
+        response="a",
+        expected_text="b",
+    )
+    assert r["score"] is None
+    assert "dimension mismatch" in r["error"].lower()
 
 
 # ---------------------------------------------------------------------------
