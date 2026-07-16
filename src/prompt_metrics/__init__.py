@@ -15,6 +15,7 @@ from .evaluators import (
 )
 from .export import export_results, flatten_dict
 from .monitoring import compare_suites, load_suite_result
+from .curation import CurationReviewer
 from .reports import generate_markdown_report
 from .runner import (
     ExperimentRunner,
@@ -57,4 +58,6 @@ __all__ = [
     "load_suite_result",
     # Synthesis
     "DatasetSynthesizer",
+    # Curation
+    "CurationReviewer",
 ]
