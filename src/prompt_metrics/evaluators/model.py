@@ -126,8 +126,6 @@ class ModelEvaluator:
         except json.JSONDecodeError:
             # Try to find a JSON object embedded in the text
             # e.g. "Here is my evaluation:\n{\"score\": 4, \"reasoning\": \"...\"}"
-            json_match = re.search(r"\{[^{}]* (?:\{[^{}]*\}[^{}]*)*\}", raw, re.DOTALL)
-            # Fix: proper JSON object regex without space
             json_match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", raw, re.DOTALL)
             if json_match:
                 try:
