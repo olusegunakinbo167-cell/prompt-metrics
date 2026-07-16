@@ -1,22 +1,38 @@
-"""prompt_metrics – LLM prompt response scoring and evaluation."""
-
-__version__ = "0.1.0"
-
+# src/prompt_metrics/__init__.py
+from .evaluators import (
+    ContainsEvaluator,
+    Evaluator,
+    EvaluatorAdapter,
+    ExactMatchEvaluator,
+    KeywordEvaluator,
+    RegexMatchEvaluator,
+)
 from .export import export_results, flatten_dict
+from .reports import generate_markdown_report
 from .runner import (
     ExperimentRunner,
-    SuiteResult,
     CaseResult,
-    RubricEvaluatorAdapter,
+    SuiteResult,
+    TestCase,
+    load_dataset,
 )
-from .reports import generate_markdown_report
 
 __all__ = [
+    # Core runner
     "ExperimentRunner",
-    "SuiteResult",
+    "TestCase",
     "CaseResult",
-    "RubricEvaluatorAdapter",
+    "SuiteResult",
+    "load_dataset",
+    # Export / reporting
     "export_results",
     "flatten_dict",
     "generate_markdown_report",
+    # Evaluators
+    "Evaluator",
+    "EvaluatorAdapter",
+    "ExactMatchEvaluator",
+    "KeywordEvaluator",
+    "RegexMatchEvaluator",
+    "ContainsEvaluator",
 ]
