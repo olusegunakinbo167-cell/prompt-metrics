@@ -3,11 +3,20 @@
 Command-line interface for prompt_metrics.
 
 Usage:
-    python -m prompt_metrics.cli --dataset data/test_cases.json
-    python -m prompt_metrics.cli --dataset data/test_cases.json \\
+    # Run an evaluation suite:
+    prompt_metrics run --dataset data/test_cases.json
+    prompt_metrics run --dataset data/test_cases.json \\
         --output-dir ./results/run_001 \\
         --evaluators exact_match,keyword \\
         --formats csv,json,md
+
+    # Generate a synthetic dataset:
+    prompt_metrics synthesize \\
+        --description "A SQL query generator" \\
+        --seed-prompts "SELECT users...", "Find all orders..." \\
+        --num-cases 20 \\
+        --model my_llm:generate \\
+        --output dataset.json
 """
 
 from __future__ import annotations
@@ -32,6 +41,7 @@ from .evaluators import (
 from .export import export_results
 from .reports import generate_markdown_report
 from .runner import ExperimentRunner, load_dataset
+from .synthesis import DatasetSynthesizer
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +128,7 @@ def _make_judge_factory(
                 "Pass --judge-model <module:callable> on the command line, "
                 "or set the JUDGE_MODEL environment variable, e.g.:\n"
                 '  export JUDGE_MODEL="my_llm:judge"\n'
-                "  prompt_metrics --dataset data.json --evaluators qa_judge --judge-model my_llm:judge\n\n"
+                "  prompt_metrics run --dataset data.json --evaluators qa_judge --judge-model my_llm:judge\n\n"
                 "The judge model callable must accept (prompt: str) -> str "
                 "and return the judge LLM's raw text response."
             )
@@ -253,11 +263,11 @@ def _resolve_generator(spec: str | None) -> Callable[[str], str]:
     """
     if spec is None or spec == "mock":
         return _default_generator
-    return _resolve_callable(spec, kind="generator")
+    return _resolve_callable(spec, kind="generator")  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# CLI parser
 # ---------------------------------------------------------------------------
 
 
@@ -269,6 +279,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = argparse.ArgumentParser(
         prog="prompt_metrics",
+        description="LLM prompt evaluation toolkit — run experiments and generate synthetic test datasets.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    subparsers = p.add_subparsers(dest="command", help="subcommand")
+
+    # ---- run subcommand ----
+    run_p = subparsers.add_parser(
+        "run",
+        help="Run a prompt evaluation experiment over a JSON dataset.",
         description=(
             "Run prompt evaluation experiments over a JSON test dataset.\n\n"
             "Semantic evaluator: uses TF-IDF fallback by default, or configure\n"
@@ -280,56 +299,56 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=f"""Available evaluators: {available}
 
 examples:
-  prompt_metrics --dataset data/test_cases.json
-  prompt_metrics --dataset data/test_cases.json --output-dir ./results/run_001
-  prompt_metrics --dataset data/test_cases.json --evaluators exact_match,keyword
-  prompt_metrics --dataset data/test_cases.json --formats csv,md
-  prompt_metrics --dataset data/test_cases.json --generator my_llm:generate
+  prompt_metrics run --dataset data/test_cases.json
+  prompt_metrics run --dataset data/test_cases.json --output-dir ./results/run_001
+  prompt_metrics run --dataset data/test_cases.json --evaluators exact_match,keyword
+  prompt_metrics run --dataset data/test_cases.json --formats csv,md
+  prompt_metrics run --dataset data/test_cases.json --generator my_llm:generate
 
   # Semantic similarity (TF-IDF fallback, zero dependencies):
-  prompt_metrics --dataset data/test_cases.json --evaluators semantic
+  prompt_metrics run --dataset data/test_cases.json --evaluators semantic
 
   # Semantic similarity with custom embedding API:
-  prompt_metrics --dataset data/test_cases.json \\
+  prompt_metrics run --dataset data/test_cases.json \\
     --evaluators semantic --embedding-model my_embeddings:embed
 
   # LLM-as-a-judge evaluation:
-  prompt_metrics --dataset data/test_cases.json \\
+  prompt_metrics run --dataset data/test_cases.json \\
     --evaluators qa_judge --judge-model my_llm:judge
-  prompt_metrics --dataset data/test_cases.json \\
+  prompt_metrics run --dataset data/test_cases.json \\
     --evaluators critique_helpfulness --judge-model my_llm:judge
 """,
     )
-    p.add_argument(
+    run_p.add_argument(
         "--dataset",
         required=True,
         help="Path to the input JSON dataset file. "
         "Each entry must have: id, input_prompt. "
         "Optional: expected_text, keywords.",
     )
-    p.add_argument(
+    run_p.add_argument(
         "--output-dir",
         default="./results",
         help="Destination directory for generated outputs (default: ./results).",
     )
-    p.add_argument(
+    run_p.add_argument(
         "--evaluators",
         default="",
         help=(
             "Comma-separated list of evaluators to run. "
             f"Available: {available}. "
             "If omitted, runs all built-in text evaluators "
-            "(exact_match, keyword, contains). "
+            "(exact_match, keyword, contains, semantic). "
             "Model-based evaluators (qa_judge, critique_judge) require "
             "--judge-model."
         ),
     )
-    p.add_argument(
+    run_p.add_argument(
         "--formats",
         default="csv,json,md",
         help="Comma-separated output formats: csv, json, md (default: all three).",
     )
-    p.add_argument(
+    run_p.add_argument(
         "--generator",
         default=None,
         help=(
@@ -339,7 +358,7 @@ examples:
             "The callable must accept (prompt: str) -> str."
         ),
     )
-    p.add_argument(
+    run_p.add_argument(
         "--judge-model",
         default=None,
         help=(
@@ -351,7 +370,7 @@ examples:
             "Can also be set via JUDGE_MODEL environment variable."
         ),
     )
-    p.add_argument(
+    run_p.add_argument(
         "--embedding-model",
         default=None,
         help=(
@@ -364,18 +383,121 @@ examples:
             "Can also be set via EMBEDDING_MODEL environment variable."
         ),
     )
-    p.add_argument(
+    run_p.add_argument(
         "--fail-fast",
         action="store_true",
         help="Stop on the first case/generator error instead of continuing.",
     )
+
+    # ---- synthesize subcommand ----
+    synth_p = subparsers.add_parser(
+        "synthesize",
+        help="Generate a synthetic evaluation dataset using an LLM.",
+        description=(
+            "Generate a synthetic test dataset for prompt evaluation.\n\n"
+            "Uses an LLM to expand seed examples + a task description "
+            "into a diverse evaluation suite with varied inputs, "
+            "expected outputs, and keywords.\n\n"
+            "The model client must accept (prompt: str) -> str and return "
+            "the LLM's raw text response. Configure with --model or "
+            "SYNTHESIS_MODEL env var."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""examples:
+  # Generate 20 test cases for a SQL generator:
+  prompt_metrics synthesize \\
+    --description "A SQL query generator that converts natural language to PostgreSQL" \\
+    --seed-prompts "Find all users who signed up last week" "List orders over $100" \\
+    --num-cases 20 \\
+    --model my_llm:generate \\
+    --output sql_test_cases.json
+
+  # Generate from a description only (no seeds):
+  prompt_metrics synthesize \\
+    --description "A customer support chatbot that answers questions about order status, returns, and shipping" \\
+    --num-cases 15 \\
+    --model my_llm:generate \\
+    --output support_test_cases.json
+
+  # Use seed prompts from a file (one per line):
+  prompt_metrics synthesize \\
+    --description "Text summarization tool" \\
+    --seed-prompts-file ./seeds.txt \\
+    --num-cases 30 \\
+    --model my_llm:generate \\
+    --output summary_test_cases.json
+""",
+    )
+    synth_p.add_argument(
+        "--description",
+        required=True,
+        help=(
+            "Description of the application / prompt being tested. "
+            "Be specific — this drives the diversity and relevance of "
+            "generated cases. E.g. \"A SQL query generator that converts "
+            "natural language to PostgreSQL\" or \"A customer support "
+            "chatbot that answers questions about order status\"."
+        ),
+    )
+    synth_seed_group = synth_p.add_mutually_exclusive_group()
+    synth_seed_group.add_argument(
+        "--seed-prompts",
+        nargs="*",
+        default=[],
+        metavar="PROMPT",
+        help=(
+            "Seed example prompts / inputs (space-separated). "
+            "These guide style and structure. Can be omitted if "
+            "--description is detailed enough."
+        ),
+    )
+    synth_seed_group.add_argument(
+        "--seed-prompts-file",
+        metavar="PATH",
+        help=(
+            "Path to a text file with seed prompts, one per line. "
+            "Empty lines are ignored."
+        ),
+    )
+    synth_p.add_argument(
+        "--num-cases",
+        type=int,
+        default=10,
+        help="Number of test cases to generate (default: 10).",
+    )
+    synth_p.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Model client for dataset synthesis, in 'module:callable' format. "
+            'e.g. "my_llm:generate". '
+            "The callable must accept (prompt: str) -> str and return "
+            "the model's raw text response. "
+            "Can also be set via SYNTHESIS_MODEL environment variable."
+        ),
+    )
+    synth_p.add_argument(
+        "--output",
+        "-o",
+        default="synthetic_dataset.json",
+        help="Output path for the generated dataset JSON (default: synthetic_dataset.json).",
+    )
+    synth_p.add_argument(
+        "--case-id-prefix",
+        default="synth",
+        help="Prefix for generated case IDs (default: synth → synth_001, synth_002, ...).",
+    )
+
     return p
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = build_parser()
-    args = parser.parse_args(argv)
+# ---------------------------------------------------------------------------
+# Subcommand implementations
+# ---------------------------------------------------------------------------
 
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    """Execute the `run` subcommand."""
     # ---- Store judge_model / embedding_model specs for evaluator factories ----
     # Evaluator factories read these globals to resolve their clients
     if args.judge_model:
@@ -501,6 +623,145 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  {path}")
 
     return 0
+
+
+def _cmd_synthesize(args: argparse.Namespace) -> int:
+    """Execute the `synthesize` subcommand."""
+    # ---- Resolve seed prompts ----
+    seed_prompts: list[str] = []
+    if args.seed_prompts_file:
+        seed_path = Path(args.seed_prompts_file)
+        if not seed_path.exists():
+            print(f"Error: seed prompts file not found: {seed_path}", file=sys.stderr)
+            return 2
+        try:
+            with seed_path.open("r", encoding="utf-8") as f:
+                seed_prompts = [line.strip() for line in f if line.strip()]
+        except Exception as e:
+            print(f"Error reading seed prompts file {seed_path}: {e}", file=sys.stderr)
+            return 2
+    else:
+        seed_prompts = list(args.seed_prompts or [])
+
+    # ---- Resolve model client ----
+    model_spec = args.model or os.environ.get("SYNTHESIS_MODEL")
+    if not model_spec:
+        print(
+            "Error: synthesize requires a model client.\n"
+            "Pass --model <module:callable> on the command line, "
+            "or set the SYNTHESIS_MODEL environment variable, e.g.:\n"
+            '  export SYNTHESIS_MODEL="my_llm:generate"\n'
+            "  prompt_metrics synthesize --description \"...\" --model my_llm:generate\n\n"
+            "The model callable must accept (prompt: str) -> str "
+            "and return the model's raw text response.",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        model_client = _resolve_callable(model_spec, kind="synthesis model")
+    except Exception as e:
+        print(f"Error resolving synthesis model {model_spec!r}: {e}", file=sys.stderr)
+        return 2
+
+    # ---- Validate num_cases ----
+    if args.num_cases < 1:
+        print("Error: --num-cases must be >= 1", file=sys.stderr)
+        return 2
+
+    # ---- Generate dataset ----
+    print(
+        f"Synthesizing {args.num_cases} test case(s)...\n"
+        f"Description: {args.description[:120]}"
+        + ("…" if len(args.description) > 120 else "")
+        + f"\nSeed prompts: {len(seed_prompts)}"
+        + (f" ({', '.join(repr(s[:40] + '…' if len(s) > 40 else s) for s in seed_prompts[:2])}" if seed_prompts else " (none)")
+        + (f" … +{len(seed_prompts) - 2} more" if len(seed_prompts) > 2 else "")
+        + f"\nModel: {model_spec}\n"
+    )
+
+    synthesizer = DatasetSynthesizer(
+        model_client=model_client,  # type: ignore[arg-type]
+        case_id_prefix=args.case_id_prefix,
+    )
+
+    try:
+        dataset = synthesizer.generate_dataset(
+            seed_prompts=seed_prompts,
+            description=args.description,
+            num_cases=args.num_cases,
+        )
+    except Exception as e:
+        print(f"\nSynthesis failed: {e}", file=sys.stderr)
+        return 1
+
+    # ---- Write output ----
+    output_path = Path(args.output)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with output_path.open("w", encoding="utf-8") as f:
+            json.dump(dataset, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Error writing dataset to {output_path}: {e}", file=sys.stderr)
+        return 1
+
+    print(
+        f"✅ Generated {len(dataset)} test case(s)\n"
+        f"   Output: {output_path}\n"
+        f"   Case IDs: {dataset[0]['id']} … {dataset[-1]['id'] if len(dataset) > 1 else ''}\n"
+        f"\nRun your evaluation with:\n"
+        f"  prompt_metrics run --dataset {output_path}"
+    )
+
+    if len(dataset) < args.num_cases:
+        print(
+            f"\n⚠️  Warning: requested {args.num_cases} cases, "
+            f"but only {len(dataset)} were generated. "
+            "The model may have returned fewer cases than requested, "
+            "or some cases were dropped during parsing. "
+            "Try running again or increasing the model's max_tokens.",
+            file=sys.stderr,
+        )
+
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+
+    # Backwards compatibility: if invoked without a subcommand
+    # (e.g. `prompt_metrics --dataset ...`), auto-prepend "run".
+    # We need to detect this BEFORE parse_args(), otherwise argparse
+    # will fail with "unrecognized arguments".
+    argv_list = list(argv if argv is not None else sys.argv[1:])
+    if argv_list:
+        first = argv_list[0]
+        # If first arg is NOT a known subcommand and looks like a flag
+        # or a run-specific option, assume legacy "run" mode.
+        if first not in ("run", "synthesize", "-h", "--help"):
+            # Heuristic: if it starts with "-" OR contains a known run flag,
+            # prepend "run"
+            run_flags = ("--dataset", "--output-dir", "--evaluators", "--formats",
+                         "--generator", "--judge-model", "--embedding-model", "--fail-fast")
+            if first.startswith("-") or any(f in argv_list for f in run_flags):
+                argv_list = ["run"] + argv_list
+
+    args = parser.parse_args(argv_list if argv is not None else None)
+    command = getattr(args, "command", None)
+
+    if command == "synthesize":
+        return _cmd_synthesize(args)
+    elif command == "run":
+        return _cmd_run(args)
+    else:
+        parser.print_help()
+        return 2
 
 
 if __name__ == "__main__":
