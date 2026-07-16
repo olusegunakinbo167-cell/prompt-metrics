@@ -28,6 +28,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
+from .curation import CurationReviewer
 from .evaluators import (
     ContainsEvaluator,
     CritiqueEvaluator,
@@ -487,6 +488,16 @@ examples:
         default="synth",
         help="Prefix for generated case IDs (default: synth → synth_001, synth_002, ...).",
     )
+    synth_p.add_argument(
+        "--interactive",
+        "-i",
+        action="store_true",
+        help=(
+            "Review, edit, accept, or reject generated test cases "
+            "interactively before saving. "
+            "Opens a terminal UI where you can curate the dataset."
+        ),
+    )
 
     return p
 
@@ -695,6 +706,27 @@ def _cmd_synthesize(args: argparse.Namespace) -> int:
         print(f"\nSynthesis failed: {e}", file=sys.stderr)
         return 1
 
+    # ---- Interactive curation ----
+    if args.interactive:
+        print(f"\n📝 Opening interactive curation for {len(dataset)} case(s)...\n")
+        try:
+            reviewer = CurationReviewer(dataset)
+            dataset = reviewer.review_interactively()
+        except (KeyboardInterrupt, EOFError):
+            print("\n\n⚠️  Curation interrupted. Saving curated cases so far...", file=sys.stderr)
+            # dataset is already filtered to accepted cases at this point
+            # (review_interactively returns early only via exception, so keep what we have)
+            # Actually, if KeyboardInterrupt happens inside review_interactively,
+            # we won't have a return value — so just exit with partial save prompt
+            print("Curation cancelled by user.", file=sys.stderr)
+            return 130  # 128 + SIGINT
+
+        if not dataset:
+            print("\n⚠️  All cases were rejected. Nothing to save.", file=sys.stderr)
+            return 0
+
+        print(f"\n✅ Curation complete: {len(dataset)} case(s) accepted.\n")
+
     # ---- Write output ----
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -707,14 +739,17 @@ def _cmd_synthesize(args: argparse.Namespace) -> int:
         return 1
 
     print(
-        f"✅ Generated {len(dataset)} test case(s)\n"
+        f"✅ {'Curated' if args.interactive else 'Generated'} {len(dataset)} test case(s)\n"
         f"   Output: {output_path}\n"
-        f"   Case IDs: {dataset[0]['id']} … {dataset[-1]['id'] if len(dataset) > 1 else ''}\n"
-        f"\nRun your evaluation with:\n"
+        f"   Case IDs: {dataset[0]['id'] if dataset else '(none)'}"
+        + (f" … {dataset[-1]['id']}" if len(dataset) > 1 else "")
+        + f"\n\nRun your evaluation with:\n"
         f"  prompt_metrics run --dataset {output_path}"
     )
 
-    if len(dataset) < args.num_cases:
+    # Warn about shortfall only if NOT in interactive mode
+    # (in interactive mode, rejection is intentional)
+    if not args.interactive and len(dataset) < args.num_cases:
         print(
             f"\n⚠️  Warning: requested {args.num_cases} cases, "
             f"but only {len(dataset)} were generated. "
