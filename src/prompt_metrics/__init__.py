@@ -16,6 +16,7 @@ from .evaluators import (
 from .export import export_results, flatten_dict
 from .monitoring import compare_suites, load_suite_result
 from .curation import CurationReviewer
+from .archiver import create_run_archive
 from .reports import generate_markdown_report
 from .runner import (
     ExperimentRunner,
@@ -33,10 +34,11 @@ __all__ = [
     "CaseResult",
     "SuiteResult",
     "load_dataset",
-    # Export / reporting
+    # Export / reporting / archiving
     "export_results",
     "flatten_dict",
     "generate_markdown_report",
+    "create_run_archive",
     # Evaluators — base
     "Evaluator",
     "EvaluatorAdapter",
