@@ -15,10 +15,23 @@ jobs:
       pull-requests: write  # needed for sticky-pull-request-comment + labeling PRs
       issues: write         # PRs are issues in the API – needed for gh label edits
       actions: read         # needed for gh CLI to fetch artifacts
+      statuses: write       # needed to post commit status checks for merge blocking
 
     steps:
       - name: Check out code
         uses: actions/checkout@v4
+
+      - name: Post pending commit status
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          echo "${GITHUB_TOKEN}" | gh auth login --with-token
+          python commit_status.py \
+            --state pending \
+            --description "running prompt evaluations..." \
+            --context "prompt-metrics/eval" \
+            --sha "${{ github.sha }}" \
+            --target-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -37,6 +50,8 @@ jobs:
         run: python eval_harness.py --output latest_metrics.json --seed 42
 
       - name: Compare metrics vs baseline
+        id: compare
+        continue-on-error: true
         run: |
           python compare_metrics.py \
             --latest latest_metrics.json \
@@ -66,3 +81,33 @@ jobs:
           name: prompt-metrics
           path: latest_metrics.json
           retention-days: 90
+
+      - name: Post success commit status
+        if: steps.compare.outcome == 'success'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python commit_status.py \
+            --state success \
+            --description "all metrics within thresholds" \
+            --context "prompt-metrics/eval" \
+            --sha "${{ github.sha }}" \
+            --target-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Post failure commit status
+        if: steps.compare.outcome == 'failure'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python commit_status.py \
+            --state failure \
+            --description "regression detected \u2014 see comparison output" \
+            --context "prompt-metrics/eval" \
+            --sha "${{ github.sha }}" \
+            --target-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Fail job on regression
+        if: steps.compare.outcome == 'failure'
+        run: |
+          echo "Regression detected \u2014 see comparison.md"
+          exit 1
