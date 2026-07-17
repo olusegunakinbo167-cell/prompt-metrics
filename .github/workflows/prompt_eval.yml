@@ -1,0 +1,68 @@
+name: Prompt Eval
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  prompt-eval:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write  # needed for sticky-pull-request-comment + labeling PRs
+      issues: write         # PRs are issues in the API – needed for gh label edits
+      actions: read         # needed for gh CLI to fetch artifacts
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -e .
+
+      - name: Fetch baseline metrics
+        run: python fetch_baseline.py
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run eval harness
+        run: python eval_harness.py --output latest_metrics.json --seed 42
+
+      - name: Compare metrics vs baseline
+        run: |
+          python compare_metrics.py \
+            --latest latest_metrics.json \
+            --baseline baseline.json \
+            --max-latency-pct 10 \
+            --min-accuracy-drop 0.02 \
+            --max-cost-pct 15 \
+            --output comparison.md
+
+      - name: Auto-label PR by accuracy delta
+        if: github.event_name == 'pull_request'
+        run: python label_pr.py --latest latest_metrics.json --baseline baseline.json --metric accuracy
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+
+      - name: Post comparison to PR
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          path: comparison.md
+
+      - name: Upload metrics artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: prompt-metrics
+          path: latest_metrics.json
+          retention-days: 90
