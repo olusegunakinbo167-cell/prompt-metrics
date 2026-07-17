@@ -11,7 +11,7 @@ jobs:
   prompt-eval:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write      # read for checkout, write for auto-committing history.json on main
       pull-requests: write  # needed for sticky-pull-request-comment + labeling PRs
       issues: write         # PRs are issues in the API – needed for gh label edits
       actions: read         # needed for gh CLI to fetch artifacts
@@ -69,6 +69,55 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GITHUB_REPOSITORY: ${{ github.repository }}
 
+      - name: Generate performance history trend report
+        id: history_report
+        if: always()
+        run: |
+          # Fetch authoritative history.json from origin/main
+          # (PR branches may be stale or missing history.json entirely)
+          git fetch origin main --depth=1 || true
+          if git show origin/main:history.json > history.json 2>/dev/null; then
+            echo "Pulled authoritative history.json from origin/main"
+          fi
+
+          if [ ! -f history.json ]; then
+            echo "history.json not found – skipping trend report."
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          # Run report (exit code 3 = drift detected – don't fail the job)
+          set +e
+          python track_history.py --report --output history.json > history_report.md 2> drift_warnings.txt
+          REPORT_EXIT=$?
+          set -e
+          echo "report_exit=$REPORT_EXIT" >> "$GITHUB_OUTPUT"
+          if [ "$REPORT_EXIT" -eq 3 ]; then
+            echo "drift=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "drift=false" >> "$GITHUB_OUTPUT"
+          fi
+          # Append to GitHub Step Summary
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          cat history_report.md >> "$GITHUB_STEP_SUMMARY"
+          # If drift was detected, surface the warnings in the summary too
+          if [ -s drift_warnings.txt ]; then
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            cat drift_warnings.txt >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # Append trend table to the PR comparison comment
+          if [ -f comparison.md ]; then
+            echo "" >> comparison.md
+            echo "---" >> comparison.md
+            echo "" >> comparison.md
+            cat history_report.md >> comparison.md
+          else
+            # comparison.md missing – create it from the history report
+            cat history_report.md > comparison.md
+          fi
+
       - name: Post comparison to PR
         if: github.event_name == 'pull_request'
         uses: marocchino/sticky-pull-request-comment@v2
@@ -111,3 +160,24 @@ jobs:
         run: |
           echo "Regression detected \u2014 see comparison.md"
           exit 1
+
+      - name: Update performance history
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.compare.outcome == 'success'
+        run: |
+          python track_history.py --append -i latest_metrics.json -o history.json
+
+      - name: Commit history.json
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.compare.outcome == 'success'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add history.json
+          # Only commit if there are changes
+          if git diff --cached --quiet; then
+            echo "No changes to history.json – nothing to commit."
+            exit 0
+          fi
+          git commit -m "chore(metrics): update performance history [skip ci]"
+          # Pull with rebase in case main advanced since checkout
+          git pull --rebase origin main || true
+          git push origin HEAD:main
