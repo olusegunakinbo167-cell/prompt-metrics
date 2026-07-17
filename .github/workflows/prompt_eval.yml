@@ -10,6 +10,12 @@ on:
 jobs:
   prompt-eval:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        prompt:
+          - prompts/v1_concise.txt
+          - prompts/v2_detailed.txt
     permissions:
       contents: write      # read for checkout, write for auto-committing history.json on main
       pull-requests: write  # needed for sticky-pull-request-comment + labeling PRs
@@ -21,6 +27,14 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
 
+      - name: Set prompt slug
+        id: slug
+        run: |
+          PROMPT_PATH="${{ matrix.prompt }}"
+          SLUG="$(basename "$PROMPT_PATH" .txt | tr -c '[:alnum:]._- ' '_' | tr ' ' '_')"
+          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
+          echo "prompt_path=$PROMPT_PATH" >> "$GITHUB_OUTPUT"
+
       - name: Post pending commit status
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -28,8 +42,8 @@ jobs:
           echo "${GITHUB_TOKEN}" | gh auth login --with-token
           python commit_status.py \
             --state pending \
-            --description "running prompt evaluations..." \
-            --context "prompt-metrics/eval" \
+            --description "running prompt evaluations for ${{ steps.slug.outputs.slug }}..." \
+            --context "prompt-metrics/eval/${{ steps.slug.outputs.slug }}" \
             --sha "${{ github.sha }}" \
             --target-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
@@ -42,28 +56,37 @@ jobs:
         run: pip install -e .
 
       - name: Fetch baseline metrics
-        run: python fetch_baseline.py
+        run: python fetch_baseline.py --prompt "${{ matrix.prompt }}" --output baseline.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run eval harness
-        run: python eval_harness.py --output latest_metrics.json --seed 42
+        run: |
+          python eval_harness.py \
+            --prompt "${{ matrix.prompt }}" \
+            --output "latest_metrics_${{ steps.slug.outputs.slug }}.json" \
+            --seed 42
 
       - name: Compare metrics vs baseline
         id: compare
         continue-on-error: true
         run: |
           python compare_metrics.py \
-            --latest latest_metrics.json \
+            --latest "latest_metrics_${{ steps.slug.outputs.slug }}.json" \
             --baseline baseline.json \
             --max-latency-pct 10 \
             --min-accuracy-drop 0.02 \
             --max-cost-pct 15 \
-            --output comparison.md
+            --output "comparison_${{ steps.slug.outputs.slug }}.md"
 
       - name: Auto-label PR by accuracy delta
         if: github.event_name == 'pull_request'
-        run: python label_pr.py --latest latest_metrics.json --baseline baseline.json --metric accuracy
+        run: |
+          python label_pr.py \
+            --latest "latest_metrics_${{ steps.slug.outputs.slug }}.json" \
+            --baseline baseline.json \
+            --metric accuracy \
+            --label-prefix "${{ steps.slug.outputs.slug }}-"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -88,7 +111,7 @@ jobs:
           echo "found=true" >> "$GITHUB_OUTPUT"
           # Run report (exit code 3 = drift detected – don't fail the job)
           set +e
-          python track_history.py --report --output history.json > history_report.md 2> drift_warnings.txt
+          python track_history.py --report --output history.json > "history_report_${{ steps.slug.outputs.slug }}.md" 2> drift_warnings.txt
           REPORT_EXIT=$?
           set -e
           echo "report_exit=$REPORT_EXIT" >> "$GITHUB_OUTPUT"
@@ -99,7 +122,8 @@ jobs:
           fi
           # Append to GitHub Step Summary
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          cat history_report.md >> "$GITHUB_STEP_SUMMARY"
+          echo "## Prompt: ${{ matrix.prompt }}" >> "$GITHUB_STEP_SUMMARY"
+          cat "history_report_${{ steps.slug.outputs.slug }}.md" >> "$GITHUB_STEP_SUMMARY"
           # If drift was detected, surface the warnings in the summary too
           if [ -s drift_warnings.txt ]; then
             echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -108,27 +132,38 @@ jobs:
             echo '```' >> "$GITHUB_STEP_SUMMARY"
           fi
           # Append trend table to the PR comparison comment
-          if [ -f comparison.md ]; then
-            echo "" >> comparison.md
-            echo "---" >> comparison.md
-            echo "" >> comparison.md
-            cat history_report.md >> comparison.md
+          COMP_FILE="comparison_${{ steps.slug.outputs.slug }}.md"
+          if [ -f "$COMP_FILE" ]; then
+            echo "" >> "$COMP_FILE"
+            echo "---" >> "$COMP_FILE"
+            echo "" >> "$COMP_FILE"
+            cat "history_report_${{ steps.slug.outputs.slug }}.md" >> "$COMP_FILE"
           else
             # comparison.md missing – create it from the history report
-            cat history_report.md > comparison.md
+            cat "history_report_${{ steps.slug.outputs.slug }}.md" > "$COMP_FILE"
           fi
 
       - name: Post comparison to PR
         if: github.event_name == 'pull_request'
         uses: marocchino/sticky-pull-request-comment@v2
         with:
-          path: comparison.md
+          # Use a per-prompt header so matrix jobs don't overwrite each other
+          header: prompt-eval-${{ steps.slug.outputs.slug }}
+          path: comparison_${{ steps.slug.outputs.slug }}.md
 
       - name: Upload metrics artifact
         uses: actions/upload-artifact@v4
         with:
-          name: prompt-metrics
-          path: latest_metrics.json
+          name: prompt-metrics-${{ steps.slug.outputs.slug }}
+          path: latest_metrics_${{ steps.slug.outputs.slug }}.json
+          retention-days: 90
+
+      - name: Upload comparison artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prompt-comparison-${{ steps.slug.outputs.slug }}
+          path: comparison_${{ steps.slug.outputs.slug }}.md
           retention-days: 90
 
       - name: Post success commit status
@@ -138,8 +173,8 @@ jobs:
         run: |
           python commit_status.py \
             --state success \
-            --description "all metrics within thresholds" \
-            --context "prompt-metrics/eval" \
+            --description "all metrics within thresholds (${{ steps.slug.outputs.slug }})" \
+            --context "prompt-metrics/eval/${{ steps.slug.outputs.slug }}" \
             --sha "${{ github.sha }}" \
             --target-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
@@ -150,21 +185,21 @@ jobs:
         run: |
           python commit_status.py \
             --state failure \
-            --description "regression detected \u2014 see comparison output" \
-            --context "prompt-metrics/eval" \
+            --description "regression detected in ${{ steps.slug.outputs.slug }} — see comparison output" \
+            --context "prompt-metrics/eval/${{ steps.slug.outputs.slug }}" \
             --sha "${{ github.sha }}" \
             --target-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Fail job on regression
         if: steps.compare.outcome == 'failure'
         run: |
-          echo "Regression detected \u2014 see comparison.md"
+          echo "Regression detected in ${{ matrix.prompt }} — see comparison_${{ steps.slug.outputs.slug }}.md"
           exit 1
 
       - name: Update performance history
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.compare.outcome == 'success'
         run: |
-          python track_history.py --append -i latest_metrics.json -o history.json
+          python track_history.py --append -i "latest_metrics_${{ steps.slug.outputs.slug }}.json" -o history.json --prompt "${{ matrix.prompt }}"
 
       - name: Commit history.json
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.compare.outcome == 'success'
@@ -177,7 +212,182 @@ jobs:
             echo "No changes to history.json – nothing to commit."
             exit 0
           fi
-          git commit -m "chore(metrics): update performance history [skip ci]"
+          git commit -m "chore(metrics): update performance history for ${{ steps.slug.outputs.slug }} [skip ci]"
           # Pull with rebase in case main advanced since checkout
           git pull --rebase origin main || true
           git push origin HEAD:main
+
+  # ---------------------------------------------------------------------------
+  # Aggregate matrix results into a single PR leaderboard
+  # ---------------------------------------------------------------------------
+  prompt-eval-aggregate:
+    runs-on: ubuntu-latest
+    needs: prompt-eval
+    # Run even if some matrix variants failed — we still want the leaderboard
+    if: always() && (needs.prompt-eval.result == 'success' || needs.prompt-eval.result == 'failure')
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: read
+      issues: write
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -e .
+
+      - name: Download all prompt metric artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: prompt-metrics-*
+          path: ./artifacts
+          merge-multiple: true
+
+      - name: List downloaded artifacts
+        run: |
+          echo "Downloaded files:"
+          find ./artifacts -type f | sort
+          # Flatten to workspace root so compare_metrics.py globs find them
+          find ./artifacts -name "*.json" -exec cp -n {} . \;
+          echo ""
+          echo "Metric files in workspace:"
+          ls -la latest_metrics_*.json metrics-*.json 2>/dev/null || true
+
+      - name: Fetch baselines from main
+        run: |
+          git fetch origin main --depth=1 || true
+          # Try to extract baseline JSONs for each prompt variant
+          # Adjust this step to match your baseline storage strategy
+          mkdir -p baselines
+          # Example: if baselines are stored per-variant in the repo:
+          #   baselines/v1_concise.json, baselines/v2_detailed.json
+          # If you use fetch_baseline.py, loop over variants:
+          # for p in prompts/*.txt; do
+          #   slug=$(basename "$p" .txt)
+          #   python fetch_baseline.py --prompt "$p" --output "baseline_${slug}.json" || true
+          # done
+          #
+          # Fallback: copy any baseline_*.json files already in the repo
+          cp baseline_*.json baselines/ 2>/dev/null || true
+
+          # Flatten baselines to workspace root for glob matching
+          find baselines -name "*.json" -exec cp -n {} . \; 2>/dev/null || true
+          echo "Baseline files found:"
+          ls -la baseline*.json 2>/dev/null || echo "(none found — comparison will show baseline as — )"
+
+      - name: Generate combined leaderboard
+        id: leaderboard
+        run: |
+          python compare_metrics.py \
+            --aggregate \
+            --glob "latest_metrics_*.json" \
+            --glob "metrics-*.json" \
+            --baseline-glob "baseline_*.json" \
+            --baseline-glob "baselines/*.json" \
+            --metric accuracy \
+            --output leaderboard.md \
+            --title "Prompt Variant Leaderboard" \
+            --alert-threshold 0.50 \
+            --alert-output alerts.json \
+            || echo "leaderboard_exit=$?" >> "$GITHUB_OUTPUT"
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          cat leaderboard.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Post leaderboard to PR
+        if: github.event_name == 'pull_request'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          # Single combined comment — overwrites on each run
+          header: prompt-eval-leaderboard
+          path: leaderboard.md
+
+      - name: Upload leaderboard artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prompt-leaderboard
+          path: |
+            leaderboard.md
+            alerts.json
+          retention-days: 90
+
+      - name: Alert — open issues for hard-failing variants
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SHA: ${{ github.sha }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ ! -f alerts.json ]; then
+            echo "No alerts.json — skipping."
+            exit 0
+          fi
+
+          FAIL_COUNT=$(jq '.failures | length' alerts.json)
+          if [ "$FAIL_COUNT" -eq 0 ]; then
+            echo "No hard failures (accuracy < 0.50) — all clear."
+            exit 0
+          fi
+
+          echo "Found $FAIL_COUNT hard-failing variant(s), opening issues…"
+          echo "${GITHUB_TOKEN}" | gh auth login --with-token
+
+          jq -c '.failures[]' alerts.json | while read -r failure; do
+            VARIANT=$(echo "$failure" | jq -r '.variant')
+            SCORE=$(echo "$failure" | jq -r '.current_score')
+            BASELINE=$(echo "$failure" | jq -r '.baseline_score // "n/a"')
+            DELTA=$(echo "$failure" | jq -r '.delta // "n/a"')
+
+            TITLE="regression alert: prompt variant ${VARIANT} failed hard"
+
+            # Avoid duplicate open issues
+            EXISTING=$(gh issue list --search "\"${TITLE}\" in:title state:open" --json number --jq 'length')
+            if [ "$EXISTING" -gt 0 ]; then
+              echo "  → Open issue already exists for '${VARIANT}', skipping."
+              continue
+            fi
+
+            # Build issue body (strip leading indentation)
+            BODY=$(cat <<'ISSUE_EOF' | sed "s/__VARIANT__/${VARIANT}/g; s/__SCORE__/${SCORE}/g; s/__BASELINE__/${BASELINE}/g; s/__DELTA__/${DELTA}/g; s|__RUN_URL__|${RUN_URL}|g; s/__SHA__/${SHA}/g; s/__REF_NAME__/${REF_NAME}/g; s/__ACTOR__/${ACTOR}/g"
+          ## 🚨 Prompt regression — hard failure
+
+          **Variant:** `__VARIANT__`
+          **Accuracy:** `__SCORE__` (threshold: 0.50)
+          **Baseline:** `__BASELINE__`
+          **Delta:** `__DELTA__`
+
+          **Run:** __RUN_URL__
+          **Commit:** `__SHA__`
+          **Branch:** `__REF_NAME__`
+
+          This issue was auto-opened by the prompt-eval aggregate job after detecting an accuracy score below the hard-failure floor (0.50).
+
+          ### Next steps
+          - [ ] Investigate prompt changes in this commit
+          - [ ] Reproduce locally with `python eval_harness.py --prompt prompts/__VARIANT__.txt`
+          - [ ] Roll back / fix prompt if confirmed
+          - [ ] Close this issue once accuracy recovers above 0.50
+
+          /cc @__ACTOR__
+          ISSUE_EOF
+          )
+
+            echo "  → Opening issue for ${VARIANT} (score=${SCORE})…"
+            gh issue create \
+              --title "$TITLE" \
+              --body "$BODY" \
+              --assignee "$ACTOR" \
+              --label "perf-regression,high-priority" \
+              || echo "    Failed to create issue for ${VARIANT} (may already exist, or labels missing)"
+          done
