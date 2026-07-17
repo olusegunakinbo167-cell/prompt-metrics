@@ -16,6 +16,9 @@ jobs:
         prompt:
           - prompts/v1_concise.txt
           - prompts/v2_detailed.txt
+        model:
+          - gpt-4o-mini
+          - claude-3-5-haiku
     permissions:
       contents: write      # read for checkout, write for auto-committing history.json on main
       pull-requests: write  # needed for sticky-pull-request-comment + labeling PRs
@@ -27,13 +30,19 @@ jobs:
       - name: Check out code
         uses: actions/checkout@v4
 
-      - name: Set prompt slug
+      - name: Set prompt/model slug
         id: slug
         run: |
           PROMPT_PATH="${{ matrix.prompt }}"
-          SLUG="$(basename "$PROMPT_PATH" .txt | tr -c '[:alnum:]._- ' '_' | tr ' ' '_')"
+          MODEL="${{ matrix.model }}"
+          PROMPT_SLUG="$(basename "$PROMPT_PATH" .txt | tr -c '[:alnum:]._- ' '_' | tr ' ' '_')"
+          MODEL_SLUG="$(echo "$MODEL" | tr -c '[:alnum:]._- ' '_' | tr ' ' '_')"
+          SLUG="${PROMPT_SLUG}--${MODEL_SLUG}"
+          echo "prompt_slug=$PROMPT_SLUG" >> "$GITHUB_OUTPUT"
+          echo "model_slug=$MODEL_SLUG" >> "$GITHUB_OUTPUT"
           echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
           echo "prompt_path=$PROMPT_PATH" >> "$GITHUB_OUTPUT"
+          echo "model=$MODEL" >> "$GITHUB_OUTPUT"
 
       - name: Post pending commit status
         env:
@@ -42,7 +51,7 @@ jobs:
           echo "${GITHUB_TOKEN}" | gh auth login --with-token
           python commit_status.py \
             --state pending \
-            --description "running prompt evaluations for ${{ steps.slug.outputs.slug }}..." \
+            --description "running ${{ steps.slug.outputs.prompt_slug }} @ ${{ steps.slug.outputs.model_slug }}..." \
             --context "prompt-metrics/eval/${{ steps.slug.outputs.slug }}" \
             --sha "${{ github.sha }}" \
             --target-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
@@ -56,7 +65,16 @@ jobs:
         run: pip install -e .
 
       - name: Fetch baseline metrics
-        run: python fetch_baseline.py --prompt "${{ matrix.prompt }}" --output baseline.json
+        run: |
+          # fetch_baseline.py may not support --model yet — pass it if it does, ignore otherwise
+          python fetch_baseline.py \
+            --prompt "${{ matrix.prompt }}" \
+            --output baseline.json \
+            || python fetch_baseline.py \
+            --prompt "${{ matrix.prompt }}" \
+            --model "${{ matrix.model }}" \
+            --output baseline.json \
+            || echo '{"summary":{"total_cases":0},"results":[]}' > baseline.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
@@ -64,6 +82,7 @@ jobs:
         run: |
           python eval_harness.py \
             --prompt "${{ matrix.prompt }}" \
+            --model "${{ matrix.model }}" \
             --output "latest_metrics_${{ steps.slug.outputs.slug }}.json" \
             --seed 42
 
@@ -122,7 +141,7 @@ jobs:
           fi
           # Append to GitHub Step Summary
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "## Prompt: ${{ matrix.prompt }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "## ${{ steps.slug.outputs.prompt_slug }} @ ${{ steps.slug.outputs.model_slug }}" >> "$GITHUB_STEP_SUMMARY"
           cat "history_report_${{ steps.slug.outputs.slug }}.md" >> "$GITHUB_STEP_SUMMARY"
           # If drift was detected, surface the warnings in the summary too
           if [ -s drift_warnings.txt ]; then
@@ -147,7 +166,7 @@ jobs:
         if: github.event_name == 'pull_request'
         uses: marocchino/sticky-pull-request-comment@v2
         with:
-          # Use a per-prompt header so matrix jobs don't overwrite each other
+          # Use a per-prompt+model header so matrix jobs don't overwrite each other
           header: prompt-eval-${{ steps.slug.outputs.slug }}
           path: comparison_${{ steps.slug.outputs.slug }}.md
 
@@ -173,7 +192,7 @@ jobs:
         run: |
           python commit_status.py \
             --state success \
-            --description "all metrics within thresholds (${{ steps.slug.outputs.slug }})" \
+            --description "all metrics within thresholds (${{ steps.slug.outputs.prompt_slug }} @ ${{ steps.slug.outputs.model_slug }})" \
             --context "prompt-metrics/eval/${{ steps.slug.outputs.slug }}" \
             --sha "${{ github.sha }}" \
             --target-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
@@ -185,7 +204,7 @@ jobs:
         run: |
           python commit_status.py \
             --state failure \
-            --description "regression detected in ${{ steps.slug.outputs.slug }} — see comparison output" \
+            --description "regression in ${{ steps.slug.outputs.prompt_slug }} @ ${{ steps.slug.outputs.model_slug }} — see comparison" \
             --context "prompt-metrics/eval/${{ steps.slug.outputs.slug }}" \
             --sha "${{ github.sha }}" \
             --target-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
@@ -193,13 +212,22 @@ jobs:
       - name: Fail job on regression
         if: steps.compare.outcome == 'failure'
         run: |
-          echo "Regression detected in ${{ matrix.prompt }} — see comparison_${{ steps.slug.outputs.slug }}.md"
+          echo "Regression detected in ${{ matrix.prompt }} @ ${{ matrix.model }} — see comparison_${{ steps.slug.outputs.slug }}.md"
           exit 1
 
       - name: Update performance history
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.compare.outcome == 'success'
         run: |
-          python track_history.py --append -i "latest_metrics_${{ steps.slug.outputs.slug }}.json" -o history.json --prompt "${{ matrix.prompt }}"
+          # track_history.py may not support --model yet — try with, fall back without
+          python track_history.py \
+            --append -i "latest_metrics_${{ steps.slug.outputs.slug }}.json" \
+            -o history.json \
+            --prompt "${{ matrix.prompt }}" \
+            --model "${{ matrix.model }}" \
+          || python track_history.py \
+            --append -i "latest_metrics_${{ steps.slug.outputs.slug }}.json" \
+            -o history.json \
+            --prompt "${{ matrix.prompt }} @ ${{ matrix.model }}"
 
       - name: Commit history.json
         if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.compare.outcome == 'success'
@@ -263,15 +291,17 @@ jobs:
       - name: Fetch baselines from main
         run: |
           git fetch origin main --depth=1 || true
-          # Try to extract baseline JSONs for each prompt variant
+          # Try to extract baseline JSONs for each prompt×model variant
           # Adjust this step to match your baseline storage strategy
           mkdir -p baselines
           # Example: if baselines are stored per-variant in the repo:
-          #   baselines/v1_concise.json, baselines/v2_detailed.json
+          #   baselines/v1_concise--gpt-4o-mini.json, baselines/v2_detailed--claude-3-5-haiku.json
           # If you use fetch_baseline.py, loop over variants:
           # for p in prompts/*.txt; do
-          #   slug=$(basename "$p" .txt)
-          #   python fetch_baseline.py --prompt "$p" --output "baseline_${slug}.json" || true
+          #   for m in gpt-4o-mini claude-3-5-haiku; do
+          #     slug=$(basename "$p" .txt)--$(echo "$m" | tr -c '[:alnum:]._-' '_')
+          #     python fetch_baseline.py --prompt "$p" --model "$m" --output "baseline_${slug}.json" || true
+          #   done
           # done
           #
           # Fallback: copy any baseline_*.json files already in the repo
@@ -293,7 +323,7 @@ jobs:
             --baseline-glob "baselines/*.json" \
             --metric accuracy \
             --output leaderboard.md \
-            --title "Prompt Variant Leaderboard" \
+            --title "Prompt × Model Leaderboard" \
             --alert-threshold 0.50 \
             --alert-output alerts.json \
             || echo "leaderboard_exit=$?" >> "$GITHUB_OUTPUT"
@@ -374,9 +404,9 @@ jobs:
           This issue was auto-opened by the prompt-eval aggregate job after detecting an accuracy score below the hard-failure floor (0.50).
 
           ### Next steps
-          - [ ] Investigate prompt changes in this commit
-          - [ ] Reproduce locally with `python eval_harness.py --prompt prompts/__VARIANT__.txt`
-          - [ ] Roll back / fix prompt if confirmed
+          - [ ] Investigate prompt/model changes in this commit
+          - [ ] Reproduce locally with `python eval_harness.py --prompt prompts/__VARIANT__.txt --model <model>`
+          - [ ] Roll back / fix if confirmed
           - [ ] Close this issue once accuracy recovers above 0.50
 
           /cc @__ACTOR__
