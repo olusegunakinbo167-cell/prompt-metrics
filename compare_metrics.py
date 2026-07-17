@@ -19,10 +19,10 @@ Two modes:
    Finds all matching current metric files, pairs each with its baseline
    (by variant name), and produces a single Markdown leaderboard table:
 
-   | Variant | Current Score | Baseline Score | Delta | Status |
+   | Variant | Current Score | Baseline Score | Delta | Estimated Cost | Status |
    |---|---|---:|---:|---:|---|
-   | v1_concise | 0.842 | 0.830 | +0.012 | 🟢 improved |
-   | v2_detailed | 0.801 | 0.830 | -0.029 | 🔴 regression |
+   | v1_concise | 0.842 | 0.830 | +0.012 | $0.00042 | 🟢 improved |
+   | v2_detailed | 0.801 | 0.830 | -0.029 | $0.00410 (+850%) | 🔴 regression |
 
 The leaderboard is suitable for embedding directly into a sticky PR comment.
 """
@@ -137,6 +137,72 @@ def extract_suite_score(path: Path, metric: str | None = None) -> float | None:
         return None
 
     return statistics.mean(scores)
+
+
+def extract_cost_info(path: Path) -> dict[str, Any] | None:
+    """
+    Extract token usage / cost info from a SuiteResult JSON.
+
+    Looks for token_usage at:
+      - top-level "token_usage"
+      - summary.token_usage
+      - summary.cost / summary.estimated_cost
+
+    Returns dict with keys: estimated_cost, prompt_tokens, completion_tokens,
+    total_tokens, model  — or None if not found.
+    """
+    try:
+        with path.open() as f:
+            raw = json.load(f)
+    except Exception:
+        return None
+
+    # Hunt for token_usage dict in common locations
+    tu = None
+    if isinstance(raw, dict):
+        # Top-level
+        if "token_usage" in raw and isinstance(raw["token_usage"], dict):
+            tu = raw["token_usage"]
+        # summary.token_usage
+        elif "summary" in raw and isinstance(raw["summary"], dict):
+            summary = raw["summary"]
+            if "token_usage" in summary and isinstance(summary["token_usage"], dict):
+                tu = summary["token_usage"]
+            # Legacy flat cost fields in summary
+            elif "estimated_cost" in summary or "cost" in summary:
+                tu = {
+                    "estimated_cost": summary.get("estimated_cost", summary.get("cost")),
+                    "prompt_tokens": summary.get("prompt_tokens"),
+                    "completion_tokens": summary.get("completion_tokens"),
+                    "total_tokens": summary.get("total_tokens"),
+                    "model": summary.get("model"),
+                }
+
+    if not tu:
+        return None
+
+    # Normalize keys
+    cost = tu.get("estimated_cost")
+    if cost is None:
+        cost = tu.get("cost")
+    try:
+        cost = float(cost) if cost is not None else None
+    except Exception:
+        cost = None
+
+    def _int_or_none(v):
+        try:
+            return int(v) if v is not None else None
+        except Exception:
+            return None
+
+    return {
+        "estimated_cost": cost,
+        "prompt_tokens": _int_or_none(tu.get("prompt_tokens")),
+        "completion_tokens": _int_or_none(tu.get("completion_tokens")),
+        "total_tokens": _int_or_none(tu.get("total_tokens")),
+        "model": tu.get("model"),
+    }
 
 
 def variant_name_from_path(path: Path) -> str:
@@ -297,6 +363,17 @@ def run_aggregate(args: argparse.Namespace) -> int:
         delta = None if (current_score is None or baseline_score is None) else current_score - baseline_score
         status = classify_status(delta, args.min_accuracy_drop)
 
+        # Cost / token usage
+        current_cost_info = extract_cost_info(cf)
+        baseline_cost_info = extract_cost_info(bf) if bf else None
+
+        def _get_cost(ci):
+            return ci.get("estimated_cost") if ci else None
+
+        current_cost = _get_cost(current_cost_info)
+        baseline_cost = _get_cost(baseline_cost_info)
+        cost_delta = None if (current_cost is None or baseline_cost is None) else current_cost - baseline_cost
+
         rows.append({
             "variant": variant,
             "current_score": current_score,
@@ -305,29 +382,64 @@ def run_aggregate(args: argparse.Namespace) -> int:
             "status": status,
             "current_file": str(cf),
             "baseline_file": str(bf) if bf else None,
+            "current_cost": current_cost,
+            "baseline_cost": baseline_cost,
+            "cost_delta": cost_delta,
+            "current_cost_info": current_cost_info,
+            "baseline_cost_info": baseline_cost_info,
         })
 
     # Sort by current_score descending (best first), Nones last
     rows.sort(key=lambda r: r["current_score"] if r["current_score"] is not None else -1, reverse=True)
+
+    # Helper to format cost
+    def fmt_cost(c: float | None) -> str:
+        if c is None:
+            return "—"
+        if c < 0.001:
+            return f"${c:.6f}"
+        if c < 0.01:
+            return f"${c:.5f}"
+        if c < 1.0:
+            return f"${c:.4f}"
+        return f"${c:.2f}"
+
+    def fmt_cost_delta(cd: float | None, base: float | None) -> str:
+        if cd is None or base is None or base == 0:
+            return ""
+        pct = cd / base * 100
+        sign = "+" if cd >= 0 else ""
+        return f" ({sign}{pct:.0f}%)"
 
     # Render Markdown leaderboard
     lines: list[str] = []
     if args.title:
         lines.append(f"## {args.title}")
         lines.append("")
-    lines.append("| Variant | Current Score | Baseline Score | Delta | Status |")
-    lines.append("|---|---:|---:|---:|---|")
+    lines.append("| Variant | Current Score | Baseline Score | Delta | Estimated Cost | Status |")
+    lines.append("|---|---:|---:|---:|---:|---|")
     for r in rows:
         cs = f"{r['current_score']:.4f}" if r["current_score"] is not None else "—"
         bs = f"{r['baseline_score']:.4f}" if r["baseline_score"] is not None else "—"
         d = f"{r['delta']:+.4f}" if r["delta"] is not None else "—"
-        lines.append(f"| `{r['variant']}` | {cs} | {bs} | {d} | {r['status']} |")
+        # Cost column: current cost, with baseline delta if available
+        cost_str = fmt_cost(r.get("current_cost"))
+        if r.get("current_cost") is not None and r.get("baseline_cost") is not None:
+            cost_str += fmt_cost_delta(r.get("cost_delta"), r.get("baseline_cost"))
+        lines.append(f"| `{r['variant']}` | {cs} | {bs} | {d} | {cost_str} | {r['status']} |")
     lines.append("")
 
     # Summary footer
     improved = sum(1 for r in rows if "improved" in r["status"])
     regressed = sum(1 for r in rows if "regression" in r["status"])
-    lines.append(f"<sub>{len(rows)} variant(s) — {improved} improved, {regressed} regression(s)</sub>")
+    # Cost summary
+    costs = [r["current_cost"] for r in rows if r.get("current_cost") is not None]
+    cost_summary = ""
+    if costs:
+        total_cost = sum(costs)
+        avg_cost = total_cost / len(costs)
+        cost_summary = f" — avg cost {fmt_cost(avg_cost)}/variant, total {fmt_cost(total_cost)}"
+    lines.append(f"<sub>{len(rows)} variant(s) — {improved} improved, {regressed} regression(s){cost_summary}</sub>")
     lines.append("")
 
     markdown = "\n".join(lines)
@@ -360,6 +472,8 @@ def run_aggregate(args: argparse.Namespace) -> int:
                                 "baseline_score": r["baseline_score"],
                                 "delta": r["delta"],
                                 "current_file": r["current_file"],
+                                "estimated_cost": r.get("current_cost"),
+                                "cost_info": r.get("current_cost_info"),
                             }
                             for r in hard_failures
                         ],
