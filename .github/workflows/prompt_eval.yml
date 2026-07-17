@@ -29,6 +29,9 @@ jobs:
     steps:
       - name: Check out code
         uses: actions/checkout@v4
+        with:
+          # Full history needed for git diff change detection
+          fetch-depth: 0
 
       - name: Set prompt/model slug
         id: slug
@@ -43,6 +46,32 @@ jobs:
           echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
           echo "prompt_path=$PROMPT_PATH" >> "$GITHUB_OUTPUT"
           echo "model=$MODEL" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Change detection — skip expensive eval if prompt hasn't changed
+      # -----------------------------------------------------------------------
+      - name: Check if prompt changed
+        id: changed
+        run: |
+          # Compare prompt file against origin/main
+          # On PRs: origin/main...HEAD = changes in this PR
+          # On main push: HEAD~1...HEAD = last commit
+          git fetch origin main --depth=1 2>/dev/null || true
+          BASE_REF="origin/main"
+          if ! git rev-parse --verify "$BASE_REF" >/dev/null 2>&1; then
+            BASE_REF="HEAD~1"
+          fi
+          if git diff --quiet "$BASE_REF"...HEAD -- "${{ matrix.prompt }}" 2>/dev/null; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "📦 Prompt ${{ matrix.prompt }} unchanged vs $BASE_REF — will try cache"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "✏️  Prompt ${{ matrix.prompt }} changed — full eval required"
+          fi
+          # Also show what changed in this run for debugging
+          echo ""
+          echo "Changed files in this ref:"
+          git diff --name-only "$BASE_REF"...HEAD 2>/dev/null || git diff --name-only HEAD~1 HEAD || true
 
       - name: Post pending commit status
         env:
@@ -64,6 +93,33 @@ jobs:
       - name: Install dependencies
         run: pip install -e .
 
+      # -----------------------------------------------------------------------
+      # Cached metrics restore — saves API credits + runtime for unchanged prompts
+      # Cache key = prompt_content_hash + model + eval_code_hash
+      # → prompt edit  → cache miss → fresh eval
+      # → eval code change → cache miss → fresh eval
+      # → neither changed → cache hit → reuse results (~5s vs ~2-5min)
+      # -----------------------------------------------------------------------
+      - name: Restore cached metrics
+        id: metrics-cache
+        uses: actions/cache@v4
+        with:
+          path: latest_metrics_${{ steps.slug.outputs.slug }}.json
+          key: prompt-metrics-${{ hashFiles(matrix.prompt) }}-${{ matrix.model }}-${{ hashFiles('src/**', 'eval_harness.py', 'pyproject.toml') }}
+          restore-keys: |
+            prompt-metrics-${{ hashFiles(matrix.prompt) }}-${{ matrix.model }}-
+
+      - name: Cache status
+        run: |
+          if [ "${{ steps.metrics-cache.outputs.cache-hit }}" = "true" ]; then
+            echo "✅ Cache HIT — using cached metrics for ${{ matrix.prompt }} @ ${{ matrix.model }}"
+            echo "   Skipping eval_harness (saved ~2-5 min + API credits)"
+            ls -lh latest_metrics_${{ steps.slug.outputs.slug }}.json || true
+          else
+            echo "❌ Cache MISS — running fresh evaluation"
+            echo "   Reason: prompt_changed=${{ steps.changed.outputs.changed }}"
+          fi
+
       - name: Fetch baseline metrics
         run: |
           # fetch_baseline.py may not support --model yet — pass it if it does, ignore otherwise
@@ -79,12 +135,23 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run eval harness
+        # Skip expensive LLM calls if we have a cache hit for this exact prompt+model+code
+        if: steps.metrics-cache.outputs.cache-hit != 'true'
         run: |
           python eval_harness.py \
             --prompt "${{ matrix.prompt }}" \
             --model "${{ matrix.model }}" \
             --output "latest_metrics_${{ steps.slug.outputs.slug }}.json" \
             --seed 42
+
+      - name: Verify metrics file exists
+        run: |
+          FILE="latest_metrics_${{ steps.slug.outputs.slug }}.json"
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: $FILE not found (cache miss + eval skipped?)"
+            exit 1
+          fi
+          echo "✅ Metrics file ready: $FILE ($(stat -c%s "$FILE") bytes)"
 
       - name: Compare metrics vs baseline
         id: compare
@@ -142,6 +209,10 @@ jobs:
           # Append to GitHub Step Summary
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "## ${{ steps.slug.outputs.prompt_slug }} @ ${{ steps.slug.outputs.model_slug }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ steps.metrics-cache.outputs.cache-hit }}" = "true" ]; then
+            echo "_📦 Cached results (prompt unchanged)_" >> "$GITHUB_STEP_SUMMARY"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+          fi
           cat "history_report_${{ steps.slug.outputs.slug }}.md" >> "$GITHUB_STEP_SUMMARY"
           # If drift was detected, surface the warnings in the summary too
           if [ -s drift_warnings.txt ]; then
@@ -190,9 +261,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: |
+          CACHE_NOTE=""
+          if [ "${{ steps.metrics-cache.outputs.cache-hit }}" = "true" ]; then
+            CACHE_NOTE=" (cached)"
+          fi
           python commit_status.py \
             --state success \
-            --description "all metrics within thresholds (${{ steps.slug.outputs.prompt_slug }} @ ${{ steps.slug.outputs.model_slug }})" \
+            --description "all metrics within thresholds (${{ steps.slug.outputs.prompt_slug }} @ ${{ steps.slug.outputs.model_slug }}$CACHE_NOTE)" \
             --context "prompt-metrics/eval/${{ steps.slug.outputs.slug }}" \
             --sha "${{ github.sha }}" \
             --target-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
@@ -216,7 +291,9 @@ jobs:
           exit 1
 
       - name: Update performance history
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.compare.outcome == 'success'
+        # Only append to history on fresh evals (not cache hits),
+        # to avoid duplicate entries for unchanged prompts
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.compare.outcome == 'success' && steps.metrics-cache.outputs.cache-hit != 'true'
         run: |
           # track_history.py may not support --model yet — try with, fall back without
           python track_history.py \
@@ -230,7 +307,7 @@ jobs:
             --prompt "${{ matrix.prompt }} @ ${{ matrix.model }}"
 
       - name: Commit history.json
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.compare.outcome == 'success'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.compare.outcome == 'success' && steps.metrics-cache.outputs.cache-hit != 'true'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -252,7 +329,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: prompt-eval
     # Run even if some matrix variants failed — we still want the leaderboard
-    if: always() && (needs.prompt-eval.result == 'success' || needs.prompt-eval.result == 'failure')
+    if: always() && (needs.prompt-eval.result == 'success' || needs.prompt-eval.result == 'failure' || needs.prompt-eval.result == 'skipped')
     permissions:
       contents: read
       pull-requests: write
@@ -374,10 +451,12 @@ jobs:
           echo "${GITHUB_TOKEN}" | gh auth login --with-token
 
           jq -c '.failures[]' alerts.json | while read -r failure; do
-            VARIANT=$(echo "$failure" | jq -r '.variant')
+            VARIANT=$(echo "$failure" | jq -r '.display_variant // .variant')
             SCORE=$(echo "$failure" | jq -r '.current_score')
             BASELINE=$(echo "$failure" | jq -r '.baseline_score // "n/a"')
             DELTA=$(echo "$failure" | jq -r '.delta // "n/a"')
+            MODEL=$(echo "$failure" | jq -r '.model // "unknown"')
+            PROMPT=$(echo "$failure" | jq -r '.prompt // .variant')
 
             TITLE="regression alert: prompt variant ${VARIANT} failed hard"
 
@@ -388,11 +467,13 @@ jobs:
               continue
             fi
 
-            # Build issue body (strip leading indentation)
-            BODY=$(cat <<'ISSUE_EOF' | sed "s/__VARIANT__/${VARIANT}/g; s/__SCORE__/${SCORE}/g; s/__BASELINE__/${BASELINE}/g; s/__DELTA__/${DELTA}/g; s|__RUN_URL__|${RUN_URL}|g; s/__SHA__/${SHA}/g; s/__REF_NAME__/${REF_NAME}/g; s/__ACTOR__/${ACTOR}/g"
+            # Build issue body
+            BODY=$(cat <<'ISSUE_EOF' | sed "s/__VARIANT__/${VARIANT}/g; s/__SCORE__/${SCORE}/g; s/__BASELINE__/${BASELINE}/g; s/__DELTA__/${DELTA}/g; s|__RUN_URL__|${RUN_URL}|g; s/__SHA__/${SHA}/g; s/__REF_NAME__/${REF_NAME}/g; s/__ACTOR__/${ACTOR}/g; s/__MODEL__/${MODEL}/g; s/__PROMPT__/${PROMPT}/g"
           ## 🚨 Prompt regression — hard failure
 
           **Variant:** `__VARIANT__`
+          **Prompt:** `__PROMPT__`
+          **Model:** `__MODEL__`
           **Accuracy:** `__SCORE__` (threshold: 0.50)
           **Baseline:** `__BASELINE__`
           **Delta:** `__DELTA__`
@@ -405,7 +486,7 @@ jobs:
 
           ### Next steps
           - [ ] Investigate prompt/model changes in this commit
-          - [ ] Reproduce locally with `python eval_harness.py --prompt prompts/__VARIANT__.txt --model <model>`
+          - [ ] Reproduce locally: `python eval_harness.py --prompt prompts/__PROMPT__.txt --model __MODEL__`
           - [ ] Roll back / fix if confirmed
           - [ ] Close this issue once accuracy recovers above 0.50
 
