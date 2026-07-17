@@ -213,12 +213,56 @@ def variant_name_from_path(path: Path) -> str:
       latest_metrics_v1_concise.json -> v1_concise
       metrics-v1_concise.json        -> v1_concise
       v1_concise.json                -> v1_concise
+      latest_metrics_v1_concise--gpt-4o-mini.json -> v1_concise--gpt-4o-mini
     """
     name = path.stem
     # Strip common prefixes
     name = re.sub(r'^(latest_)?metrics[-_]', '', name)
     name = re.sub(r'^latest_metrics_?', '', name)
     return name or path.stem
+
+
+def split_prompt_model(variant: str) -> tuple[str, str | None]:
+    """
+    Split a variant string like "v1_concise--gpt-4o-mini" or
+    "v1_concise-gpt-4o-mini" into (prompt, model).
+
+    Returns (prompt, model) where model may be None if not detectable.
+    """
+    # Common model name fragments to detect
+    model_markers = [
+        "gpt-4o", "gpt-3.5", "gpt-4", "claude", "gemini", "llama", "mistral",
+        "haiku", "sonnet", "opus", "mini", "turbo", "flash", "pro",
+    ]
+    # Try double-dash separator first (prompt--model)
+    if "--" in variant:
+        prompt, model_part = variant.split("--", 1)
+        return prompt, model_part
+    # Try to find a model marker in the string
+    vl = variant.lower()
+    for marker in model_markers:
+        # Look for -marker or _marker boundary
+        for sep in ("-", "_"):
+            needle = sep + marker
+            idx = vl.find(needle)
+            if idx > 0:
+                prompt = variant[:idx]
+                model = variant[idx + 1 :]
+                # Heuristic: model part should be reasonably short and
+                # contain a known model token
+                if len(model) < 40:
+                    return prompt, model
+    return variant, None
+
+
+def format_variant_display(prompt: str, model: str | None) -> str:
+    """Format 'v1_concise' + 'gpt-4o-mini' → 'v1_concise (gpt-4o-mini)'."""
+    if not model:
+        return prompt
+    # Avoid duplicating if model is already in prompt string
+    if model.lower() in prompt.lower():
+        return prompt
+    return f"{prompt} ({model})"
 
 
 def find_baseline_for_variant(variant: str, baseline_files: list[Path], baseline_dir: Path | None) -> Path | None:
@@ -363,7 +407,7 @@ def run_aggregate(args: argparse.Namespace) -> int:
         delta = None if (current_score is None or baseline_score is None) else current_score - baseline_score
         status = classify_status(delta, args.min_accuracy_drop)
 
-        # Cost / token usage
+        # Cost / token usage – also gives us the model name
         current_cost_info = extract_cost_info(cf)
         baseline_cost_info = extract_cost_info(bf) if bf else None
 
@@ -374,8 +418,18 @@ def run_aggregate(args: argparse.Namespace) -> int:
         baseline_cost = _get_cost(baseline_cost_info)
         cost_delta = None if (current_cost is None or baseline_cost is None) else current_cost - baseline_cost
 
+        # Split variant into prompt + model for display
+        # Prefer model from token_usage JSON (authoritative), fall back to parsing filename
+        prompt_name, model_from_filename = split_prompt_model(variant)
+        model_from_json = (current_cost_info or {}).get("model") if current_cost_info else None
+        model_name = model_from_json or model_from_filename
+        display_variant = format_variant_display(prompt_name, model_name)
+
         rows.append({
             "variant": variant,
+            "prompt": prompt_name,
+            "model": model_name,
+            "display_variant": display_variant,
             "current_score": current_score,
             "baseline_score": baseline_score,
             "delta": delta,
@@ -426,7 +480,9 @@ def run_aggregate(args: argparse.Namespace) -> int:
         cost_str = fmt_cost(r.get("current_cost"))
         if r.get("current_cost") is not None and r.get("baseline_cost") is not None:
             cost_str += fmt_cost_delta(r.get("cost_delta"), r.get("baseline_cost"))
-        lines.append(f"| `{r['variant']}` | {cs} | {bs} | {d} | {cost_str} | {r['status']} |")
+        # Use display_variant (prompt + model) if available, fall back to variant
+        variant_label = r.get("display_variant") or r["variant"]
+        lines.append(f"| `{variant_label}` | {cs} | {bs} | {d} | {cost_str} | {r['status']} |")
     lines.append("")
 
     # Summary footer
@@ -468,6 +524,9 @@ def run_aggregate(args: argparse.Namespace) -> int:
                         "failures": [
                             {
                                 "variant": r["variant"],
+                                "prompt": r.get("prompt"),
+                                "model": r.get("model"),
+                                "display_variant": r.get("display_variant"),
                                 "current_score": r["current_score"],
                                 "baseline_score": r["baseline_score"],
                                 "delta": r["delta"],
