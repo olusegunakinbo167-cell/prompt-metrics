@@ -91,7 +91,24 @@ def main() -> int:
         default=None,
         help="Optional URL to link from the status check",
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the API payload instead of posting it",
+    )
     args = parser.parse_args()
+
+    payload = {
+        "state": args.state,
+        "description": args.description,
+        "context": args.context,
+    }
+    if args.target_url:
+        payload["target_url"] = args.target_url
+
+    if args.dry_run:
+        print(json.dumps(payload, indent=2))
+        return 0
 
     # Bail out cleanly if gh isn't usable — don't break local runs
     gh_ok, gh_reason = check_gh_available()
@@ -108,14 +125,6 @@ def main() -> int:
     if not repo:
         print("warning: skipping commit status — could not resolve owner/repo", file=sys.stderr)
         return 0
-
-    payload = {
-        "state": args.state,
-        "description": args.description,
-        "context": args.context,
-    }
-    if args.target_url:
-        payload["target_url"] = args.target_url
 
     # Post status via gh api
     try:
